@@ -272,27 +272,32 @@ def process():
                 })
                 
             except Exception as e:
-                print(f"Error processing image {idx}: {str(e)}")
+                error_msg = str(e).encode('ascii', 'ignore').decode('ascii')
+                print(f"Error processing image {idx}: {error_msg}")
                 results.append({
                     "status": "error",
                     "index": idx,
                     "source_url": url,
-                    "error": str(e)
+                    "error": error_msg
                 })
 
+        # Force ASCII encoding on all response data
+        safe_prompt = prompt.encode('ascii', 'ignore').decode('ascii') if prompt else ""
+        
         return jsonify({
             "success": True,
             "count": len(results),
             "order_id": order_id,
-            "prompt_used": prompt[:100] + "..." if len(prompt) > 100 else prompt,
+            "prompt_used": safe_prompt[:100] + "..." if len(safe_prompt) > 100 else safe_prompt,
             "results": results
         })
         
     except Exception as e:
-        print(f"Request failed: {str(e)}")
+        error_msg = str(e).encode('ascii', 'ignore').decode('ascii')
+        print(f"Request failed: {error_msg}")
         return jsonify({
             "success": False,
-            "error": str(e)
+            "error": error_msg
         }), 500
 
 @app.route("/test", methods=["GET", "POST"])
