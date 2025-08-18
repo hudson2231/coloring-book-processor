@@ -89,7 +89,7 @@ def _call_openai_edit(png_bytes: bytes, prompt: str) -> bytes:
         f.write(png_bytes)
 
     with open(tmp_path, "rb") as f:
-        resp = client.images.edits(
+        resp = client.images.edit(
             model="gpt-image-1",
             image=f,
             prompt=prompt or DEFAULT_PROMPT,
