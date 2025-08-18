@@ -7,6 +7,8 @@ from flask import Flask, request, jsonify
 from google.cloud import storage
 from openai import OpenAI
 import re
+from PIL import Image
+import tempfile
 
 # --- Config ---
 # NEVER put API keys in code! Use environment variables
@@ -40,8 +42,11 @@ def sanitize_text(s: str) -> str:
     """Strip invisible Unicode separators and ensure clean utf-8."""
     if not isinstance(s, str):
         s = str(s)
+    # Remove problematic Unicode characters
     s = s.replace(u"\u2028", " ").replace(u"\u2029", " ")
-    return s.encode("utf-8", "ignore").decode("utf-8")
+    # Remove any other non-ASCII characters that might cause issues
+    s = s.encode("ascii", "ignore").decode("ascii")
+    return s
 
 def extract_direct_image_url(url: str) -> str:
     """Extract the actual image URL from UploadKit HTML pages."""
@@ -119,26 +124,42 @@ def download_image(url: str) -> bytes:
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
     """Send image to OpenAI image edit API and return edited PNG bytes."""
-    tmp_path = f"/tmp/in_{time.time_ns()}.png"
-    
-    # Save the image temporarily
-    with open(tmp_path, "wb") as f:
-        f.write(image_bytes)
-
-    clean_prompt = sanitize_text(prompt or DEFAULT_PROMPT)
-
-    # Call OpenAI API - REMOVED quality and input_fidelity parameters
-    with open(tmp_path, "rb") as f:
+    try:
+        # Clean the prompt of any problematic characters
+        clean_prompt = sanitize_text(prompt or DEFAULT_PROMPT)
+        
+        # Clean the image by re-saving it without metadata
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        # Convert RGBA to RGB if necessary (OpenAI doesn't like transparency)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # Create a white background
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = background
+        
+        # Save to bytes
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        
+        # Call OpenAI API with clean image
         resp = client.images.edit(
             model="gpt-image-1",
-            image=f,
+            image=img_byte_arr,
             prompt=clean_prompt,
             size="1024x1024"
         )
-
-    # Get the base64 result
-    b64 = resp.data[0].b64_json
-    return base64.b64decode(b64)
+        
+        # Get the base64 result
+        b64 = resp.data[0].b64_json
+        return base64.b64decode(b64)
+        
+    except Exception as e:
+        print(f"OpenAI API error: {e}")
+        raise
 
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     """Upload PNG to GCS and return signed URL."""
@@ -261,7 +282,8 @@ def health():
     return jsonify({
         "status": "healthy",
         "service": "coloring-book-processor",
-        "gcs_available": bucket is not None
+        "gcs_available": bucket is not None,
+        "openai_configured": api_key is not None
     })
 
 @app.route("/", methods=["GET"])
