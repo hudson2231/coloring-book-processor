@@ -35,7 +35,6 @@ except Exception as e:
     storage_client = None
     bucket = None
 
-
 # --- Helpers ---
 def sanitize_text(s: str) -> str:
     """Strip invisible Unicode separators and ensure clean utf-8."""
@@ -43,7 +42,6 @@ def sanitize_text(s: str) -> str:
         s = str(s)
     s = s.replace(u"\u2028", " ").replace(u"\u2029", " ")
     return s.encode("utf-8", "ignore").decode("utf-8")
-
 
 def extract_direct_image_url(url: str) -> str:
     """Extract the actual image URL from UploadKit HTML pages."""
@@ -102,7 +100,6 @@ def extract_direct_image_url(url: str) -> str:
     # Return original URL as fallback
     return url
 
-
 def download_image(url: str) -> bytes:
     """Download image bytes from a URL."""
     # First try to get the direct image URL
@@ -120,7 +117,6 @@ def download_image(url: str) -> bytes:
     
     return resp.content
 
-
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
     """Send image to OpenAI image edit API and return edited PNG bytes."""
     tmp_path = f"/tmp/in_{time.time_ns()}.png"
@@ -131,21 +127,18 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
 
     clean_prompt = sanitize_text(prompt or DEFAULT_PROMPT)
 
-    # Call OpenAI API
+    # Call OpenAI API - REMOVED quality and input_fidelity parameters
     with open(tmp_path, "rb") as f:
         resp = client.images.edit(
             model="gpt-image-1",
             image=f,
             prompt=clean_prompt,
-            size="1024x1024",
-            quality="hd",
-            input_fidelity="high"
+            size="1024x1024"
         )
 
     # Get the base64 result
     b64 = resp.data[0].b64_json
     return base64.b64decode(b64)
-
 
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     """Upload PNG to GCS and return signed URL."""
@@ -160,7 +153,6 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     
     # Generate a signed URL that expires in 7 days
     return blob.generate_signed_url(expiration=604800)  # 7 days
-
 
 # --- Routes ---
 @app.route("/process", methods=["POST"])
@@ -236,7 +228,6 @@ def process():
             "error": str(e)
         }), 500
 
-
 @app.route("/test", methods=["GET", "POST"])
 def test():
     """Test endpoint with a sample image."""
@@ -264,7 +255,6 @@ def test():
             "error": str(e)
         }), 500
 
-
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint."""
@@ -273,7 +263,6 @@ def health():
         "service": "coloring-book-processor",
         "gcs_available": bucket is not None
     })
-
 
 @app.route("/", methods=["GET"])
 def index():
@@ -296,7 +285,6 @@ def index():
             }
         }
     })
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
