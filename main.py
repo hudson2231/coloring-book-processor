@@ -8,7 +8,6 @@ from google.cloud import storage
 from openai import OpenAI
 import re
 from PIL import Image
-import tempfile
 
 # --- Config ---
 # NEVER put API keys in code! Use environment variables
@@ -20,7 +19,7 @@ client = OpenAI(api_key=api_key)
 bucket_name = os.environ.get("GCS_BUCKET", "coloring-book-results")
 
 # Keep your optimized prompt but ensure it's ASCII-safe
-DEFAULT_PROMPT = """Convert this photo into a professional adult coloring book page: clean continuous black outlines only on pure white background, NO texture fills or sketchy lines, preserve all facial features clearly recognizable, include complete background environment with all people and architectural details, smooth solid outlines with thick lines for main subjects and medium lines for details, professional coloring book illustration style with clean empty areas to color inside the lines."""
+DEFAULT_PROMPT = "Convert this photo into a professional adult coloring book page with clean continuous black outlines only on pure white background"
 
 app = Flask(__name__)
 
@@ -36,14 +35,11 @@ except Exception as e:
 
 # --- Helpers ---
 def sanitize_text(s: str) -> str:
-    """Strip invisible Unicode separators and ensure clean utf-8."""
+    """Strip invisible Unicode separators and ensure clean ASCII."""
     if not isinstance(s, str):
         s = str(s)
-    # Remove problematic Unicode characters but keep the text meaningful
-    s = s.replace(u"\u2028", " ").replace(u"\u2029", " ")
-    # Remove other invisible Unicode characters
-    s = ''.join(char for char in s if ord(char) < 127 or char.isspace())
-    return s.strip()
+    # Force ASCII encoding
+    return s.encode('ascii', 'ignore').decode('ascii').strip()
 
 def extract_direct_image_url(url: str) -> str:
     """Extract the actual image URL from UploadKit HTML pages."""
@@ -59,7 +55,6 @@ def extract_direct_image_url(url: str) -> str:
             html_content = resp.text
             
             # Look for direct image URL in the HTML
-            # UploadKit usually has the image URL in meta tags or as a direct link
             patterns = [
                 r'<meta property="og:image" content="([^"]+)"',
                 r'<img[^>]+src="([^"]+)"',
@@ -76,35 +71,15 @@ def extract_direct_image_url(url: str) -> str:
                     elif img_url.startswith('//'):
                         return 'https:' + img_url
                     elif img_url.startswith('/'):
-                        # Extract base URL from original
                         base = '/'.join(url.split('/')[:3])
                         return base + img_url
-            
-            # If we can't find an image URL, try to extract from URL parameters
-            if 'fi=' in url:
-                # The 'fi' parameter might contain the encoded filename
-                import urllib.parse
-                parsed = urllib.parse.urlparse(url)
-                params = urllib.parse.parse_qs(parsed.query)
-                if 'fi' in params:
-                    # Decode the base64 filename
-                    try:
-                        filename = base64.b64decode(params['fi'][0]).decode('utf-8')
-                        # Construct a direct URL (this is a guess at the pattern)
-                        base_path = url.split('/files/')[0] + '/files/'
-                        return base_path + filename
-                    except:
-                        pass
-                        
         except Exception as e:
             print(f"Failed to extract image from HTML: {e}")
     
-    # Return original URL as fallback
     return url
 
 def download_image(url: str) -> bytes:
     """Download image bytes from a URL."""
-    # First try to get the direct image URL
     direct_url = extract_direct_image_url(url)
     print(f"Downloading from: {direct_url[:100]}...")
     
@@ -112,7 +87,6 @@ def download_image(url: str) -> bytes:
     resp = requests.get(direct_url, headers=headers, timeout=20)
     resp.raise_for_status()
     
-    # Check if we got HTML instead of an image
     content_type = resp.headers.get('content-type', '')
     if 'text/html' in content_type:
         raise ValueError(f"Got HTML instead of image from {direct_url[:50]}...")
@@ -122,94 +96,91 @@ def download_image(url: str) -> bytes:
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
     """Send image to OpenAI image edit API and return edited PNG bytes."""
     try:
-        # Sanitize the prompt to remove any problematic Unicode characters
-        if prompt and len(prompt) > 10:
-            clean_prompt = sanitize_text(prompt)
-        else:
-            clean_prompt = sanitize_text(DEFAULT_PROMPT)
-        
-        # If sanitization made it too short, use default
-        if len(clean_prompt) < 10:
-            clean_prompt = "Convert this photo into a professional adult coloring book page with clean continuous black outlines only on pure white background"
-        
-        print(f"Using prompt (first 50 chars): {clean_prompt[:50]}...")
-        
-        # Clean the image by re-saving it without metadata
+        # Clean the image
         img = Image.open(io.BytesIO(image_bytes))
         
-        # Convert RGBA to RGB if necessary (OpenAI doesn't like transparency)
-        if img.mode in ('RGBA', 'LA', 'P'):
-            # Create a white background
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            if img.mode == 'P':
-                img = img.convert('RGBA')
-            background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
-            img = background
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
+        # Convert to RGB if necessary
+        if img.mode != 'RGB':
+            if img.mode == 'RGBA':
+                # Create white background
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3])
+                img = background
+            else:
+                img = img.convert('RGB')
         
-        # Save to bytes
-        img_byte_arr = io.BytesIO()
-        img.save(img_byte_arr, format='PNG', optimize=False)
-        img_byte_arr.seek(0)
+        # Save as clean PNG
+        clean_img = io.BytesIO()
+        img.save(clean_img, format='PNG')
+        clean_img.seek(0)
         
-        # Call OpenAI API with clean image
-        print("Calling OpenAI API...")
+        # Use simple ASCII-only prompt
+        if prompt and len(prompt) > 10:
+            # Ensure prompt is ASCII-safe
+            clean_prompt = prompt.encode('ascii', 'ignore').decode('ascii').strip()
+        else:
+            clean_prompt = DEFAULT_PROMPT
+        
+        if not clean_prompt or len(clean_prompt) < 10:
+            clean_prompt = "Convert to line art coloring book page"
+        
+        print(f"Using prompt: {clean_prompt[:50]}...")
+        
+        # Call OpenAI API with URL response format (avoids base64 Unicode issues)
         resp = client.images.edit(
             model="gpt-image-1",
-            image=img_byte_arr,
+            image=clean_img,
             prompt=clean_prompt,
-            size="1024x1024"
+            size="1024x1024",
+            response_format="url"  # Get URL instead of base64 to avoid Unicode issues
         )
         
-        print("OpenAI API call successful")
+        # Download the result from URL
+        img_url = resp.data[0].url
+        print(f"Downloading result from OpenAI URL...")
+        img_resp = requests.get(img_url, timeout=30)
+        img_resp.raise_for_status()
         
-        # Get the base64 result
-        b64 = resp.data[0].b64_json
-        return base64.b64decode(b64)
+        return img_resp.content
         
     except Exception as e:
-        print(f"Error in call_openai_edit: {str(e)}")
-        # Try with a simpler fallback prompt if there's any error
+        error_msg = str(e).encode('ascii', 'ignore').decode('ascii')
+        print(f"Error in call_openai_edit: {error_msg}")
+        
+        # Try with simplest possible prompt as fallback
         try:
-            print("Retrying with simple prompt...")
-            simple_prompt = "Convert to professional coloring book page with black outlines on white background"
+            print("Retrying with minimal prompt...")
             
             img = Image.open(io.BytesIO(image_bytes))
             if img.mode != 'RGB':
-                if img.mode in ('RGBA', 'LA', 'P'):
-                    background = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode == 'P':
-                        img = img.convert('RGBA')
-                    background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
-                    img = background
-                else:
-                    img = img.convert('RGB')
+                img = img.convert('RGB')
             
-            img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='PNG')
-            img_byte_arr.seek(0)
+            minimal_img = io.BytesIO()
+            img.save(minimal_img, format='PNG')
+            minimal_img.seek(0)
             
             resp = client.images.edit(
                 model="gpt-image-1",
-                image=img_byte_arr,
-                prompt=simple_prompt,
-                size="1024x1024"
+                image=minimal_img,
+                prompt="line art coloring page",
+                size="1024x1024",
+                response_format="url"
             )
             
-            b64 = resp.data[0].b64_json
-            return base64.b64decode(b64)
+            img_url = resp.data[0].url
+            img_resp = requests.get(img_url, timeout=30)
+            return img_resp.content
             
         except Exception as e2:
-            print(f"Fallback also failed: {str(e2)}")
-            raise e2
+            error_msg2 = str(e2).encode('ascii', 'ignore').decode('ascii')
+            print(f"Fallback also failed: {error_msg2}")
+            raise Exception(f"Image processing failed: {error_msg2}")
 
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     """Upload PNG to GCS and return signed URL."""
     if not bucket:
-        # If no GCS, return base64 data URL instead
+        # If no GCS, return base64 data URL
         b64 = base64.b64encode(img_bytes).decode('utf-8')
-        # Return full base64 for actual use
         return f"data:image/png;base64,{b64}"
     
     blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
@@ -217,7 +188,7 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     blob.upload_from_string(img_bytes, content_type="image/png")
     
     # Generate a signed URL that expires in 7 days
-    return blob.generate_signed_url(expiration=604800)  # 7 days
+    return blob.generate_signed_url(expiration=604800)
 
 # --- Routes ---
 @app.route("/process", methods=["POST"])
@@ -225,7 +196,7 @@ def process():
     """Main processing endpoint."""
     try:
         payload = request.get_json(force=True)
-        order_id = payload.get("order_id", f"order_{int(time.time())}")
+        order_id = sanitize_text(payload.get("order_id", f"order_{int(time.time())}"))
         
         # Handle both 'image_urls' and 'urls' keys
         image_urls = payload.get("image_urls") or payload.get("urls", [])
@@ -236,7 +207,7 @@ def process():
         
         # Get and sanitize prompt
         raw_prompt = payload.get("prompt", DEFAULT_PROMPT)
-        prompt = sanitize_text(raw_prompt) if raw_prompt else sanitize_text(DEFAULT_PROMPT)
+        prompt = sanitize_text(raw_prompt) if raw_prompt else DEFAULT_PROMPT
         
         print(f"Processing order {order_id} with {len(image_urls)} images")
 
@@ -281,14 +252,14 @@ def process():
                     "error": error_msg
                 })
 
-        # Force ASCII encoding on all response data
-        safe_prompt = prompt.encode('ascii', 'ignore').decode('ascii') if prompt else ""
+        # Force ASCII encoding on response
+        safe_prompt = prompt.encode('ascii', 'ignore').decode('ascii')
         
         return jsonify({
             "success": True,
             "count": len(results),
             "order_id": order_id,
-            "prompt_used": safe_prompt[:100] + "..." if len(safe_prompt) > 100 else safe_prompt,
+            "prompt_used": safe_prompt[:100],
             "results": results
         })
         
@@ -303,16 +274,13 @@ def process():
 @app.route("/test", methods=["GET", "POST"])
 def test():
     """Test endpoint with a sample image."""
-    # Use a public domain test image
     test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/320px-Cat03.jpg"
     
     try:
         raw = download_image(test_url)
-        # Use the same high-quality prompt
-        test_prompt = "Convert to professional coloring book page with clean black outlines on white background"
-        edited = call_openai_edit(raw, test_prompt)
+        edited = call_openai_edit(raw, "Convert to coloring book page")
         
-        # Return as base64 for easy testing
+        # Return as base64 for testing
         b64 = base64.b64encode(edited).decode('utf-8')
         
         return jsonify({
@@ -324,9 +292,10 @@ def test():
         })
         
     except Exception as e:
+        error_msg = str(e).encode('ascii', 'ignore').decode('ascii')
         return jsonify({
             "success": False,
-            "error": str(e)
+            "error": error_msg
         }), 500
 
 @app.route("/health", methods=["GET"])
