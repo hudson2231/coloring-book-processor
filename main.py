@@ -20,28 +20,6 @@ for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"
 os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
 
-# ---------- OpenAI client (lazy init so /health never crashes) ----------
-client = None
-def get_openai():
-    global client
-    if client is None:
-        key = os.environ.get("OPENAI_API_KEY")
-        if not key:
-            raise RuntimeError("OPENAI_API_KEY not set")
-        client = OpenAI(api_key=key)
-    return client
-
-# ---------- Config ----------
-bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
-DEFAULT_PROMPT = (
-    "Convert this photo into a professional adult coloring book page with clean continuous "
-    "black outlines only on a pure white background"
-)
-
-# Limits & timeouts
-MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20MB
-REQUEST_TIMEOUT = 30  # seconds for outbound HTTP
-
 app = Flask(__name__)
 
 # ---------- Utilities (Unicode hardening) ----------
@@ -49,22 +27,19 @@ def safe_str(obj):
     """Convert any object to a safe ASCII string, removing problematic Unicode."""
     try:
         s = str(obj)
-        # Replace line/paragraph separators & NBSP
         s = (
-            s.replace("\u2028", " ")
-             .replace("\u2029", " ")
-             .replace("\u00a0", " ")
-             .replace("\u200b", "")
-             .replace("\u200c", "")
-             .replace("\u200d", "")
+            s.replace("\u2028", " ")  # line sep
+             .replace("\u2029", " ")  # paragraph sep
+             .replace("\u00a0", " ")  # NBSP
+             .replace("\u200b", "")   # zero-width space
+             .replace("\u200c", "")   # ZWNJ
+             .replace("\u200d", "")   # ZWJ
         )
-        # Force ASCII-safe
         return "".join(ch if ord(ch) < 128 else "?" for ch in s)
     except Exception:
         return "Error converting to string"
 
 def make_safe_dict(obj):
-    """Recursively cast arbitraries into ASCII-safe structures for JSON."""
     if isinstance(obj, dict):
         return {safe_str(k): make_safe_dict(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -75,12 +50,40 @@ def make_safe_dict(obj):
         return safe_str(obj)
 
 def safe_json_response(data, status_code=200):
-    safe_data = make_safe_dict(data)
-    json_str = json.dumps(safe_data, ensure_ascii=True, separators=(",", ":"))
-    return Response(json_str, status=status_code, mimetype="application/json")
+    txt = json.dumps(make_safe_dict(data), ensure_ascii=True, separators=(",", ":"))
+    return Response(txt, status=status_code, mimetype="application/json")
 
 def sanitize_text(s: str) -> str:
     return safe_str(s).strip()
+
+def sanitize_key(s: str) -> str:
+    """Extra strict: remove invisible chars AND spaces from API keys."""
+    s = sanitize_text(s)
+    return s.replace(" ", "")
+
+# ---------- OpenAI client (lazy init; sanitizes API key) ----------
+client = None
+def get_openai():
+    global client
+    if client is None:
+        raw_key = os.environ.get("OPENAI_API_KEY", "")
+        key = sanitize_key(raw_key)
+        if not key:
+            raise RuntimeError("OPENAI_API_KEY not set")
+        # also overwrite env to prevent any library fallback using the raw value
+        os.environ["OPENAI_API_KEY"] = key
+        client = OpenAI(api_key=key)
+        print(f"[openai] client initialized")
+    return client
+
+# ---------- Config ----------
+bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
+DEFAULT_PROMPT = (
+    "Convert this photo into a professional adult coloring book page with clean continuous "
+    "black outlines only on a pure white background"
+)
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+REQUEST_TIMEOUT = 30
 
 # ---------- GCS client ----------
 try:
@@ -94,12 +97,10 @@ except Exception as e:
 
 # ---------- Image helpers ----------
 def extract_direct_image_url(url: str) -> str:
-    """Pull direct image URL from UploadKit HTML pages if needed."""
     url = sanitize_text(url)
     lower = url.lower()
     if lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
         return url
-
     if "uploadkit" in lower or "download.html" in lower:
         try:
             resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "ColoringBookProcessor/1.0"})
@@ -128,26 +129,22 @@ def extract_direct_image_url(url: str) -> str:
 def download_image(url: str) -> bytes:
     direct = extract_direct_image_url(url)
     print(f"[fetch] {direct[:120]}")
-
     headers = {"User-Agent": "ColoringBookProcessor/1.0"}
     with requests.get(direct, headers=headers, timeout=REQUEST_TIMEOUT, stream=True) as r:
         r.raise_for_status()
-        ct = r.headers.get("content-type", "")
-        if "text/html" in ct.lower():
+        ct = (r.headers.get("content-type", "") or "").lower()
+        if "text/html" in ct:
             raise ValueError("Got HTML instead of image")
-        total = 0
-        chunks = []
+        total, chunks = 0, []
         for chunk in r.iter_content(chunk_size=8192):
             if chunk:
                 total += len(chunk)
                 if total > MAX_IMAGE_BYTES:
                     raise ValueError("Image exceeds max size (20MB)")
                 chunks.append(chunk)
-        data = b"".join(chunks)
-    return data
+    return b"".join(chunks)
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-    """Send image to OpenAI image edit API and return edited PNG bytes."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         if img.mode == "RGBA":
@@ -164,6 +161,8 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 10) else sanitize_text(DEFAULT_PROMPT)
         if not clean_prompt or len(clean_prompt) < 10:
             clean_prompt = "Convert to line art coloring book page"
+        # extra belt-and-suspenders: ensure ASCII prompt
+        clean_prompt = clean_prompt.encode("ascii", "ignore").decode("ascii")
 
         print(f"[openai] prompt: {clean_prompt[:80]}")
 
@@ -203,15 +202,12 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
-    """Upload PNG to GCS and return signed URL (or data URL if no GCS)."""
     if not bucket:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
         return f"data:image/png;base64,{b64}"
-
     blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
     blob = bucket.blob(blob_name)
     blob.upload_from_string(img_bytes, content_type="image/png")
-    # v4 signed URL
     return blob.generate_signed_url(expiration=timedelta(days=7))
 
 # ---------- Routes ----------
@@ -219,16 +215,11 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
 def process():
     try:
         payload = request.get_json(force=True) or {}
-
         order_id = sanitize_text(payload.get("order_id", f"order_{int(time.time())}"))
-
-        # Accept either "image_urls" or "urls"
         image_urls = payload.get("image_urls") or payload.get("urls") or []
         if isinstance(image_urls, str):
             image_urls = [u.strip() for u in image_urls.split(",") if u.strip()]
-        # Sanitize all URLs
         image_urls = [sanitize_text(u) for u in image_urls]
-
         raw_prompt = payload.get("prompt", DEFAULT_PROMPT)
         prompt = sanitize_text(raw_prompt) if raw_prompt else DEFAULT_PROMPT
 
@@ -247,7 +238,7 @@ def process():
                     "index": idx,
                     "source_url": url,
                     "result_url": signed if bucket else None,
-                    "result_base64": None if bucket else signed,  # data URL in no-GCS mode
+                    "result_base64": None if bucket else signed,
                     "storage_type": "gcs" if bucket else "data-url"
                 })
             except Exception as e:
@@ -262,7 +253,6 @@ def process():
             "prompt_used": (prompt.encode("ascii", "ignore").decode("ascii"))[:100],
             "results": results
         })
-
     except Exception as e:
         err = safe_str(e)
         print(f"[process] request failed: {err}")
@@ -317,5 +307,4 @@ def index():
     })
 
 if __name__ == "__main__":
-    # For local runs only; Cloud Run uses Gunicorn
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
