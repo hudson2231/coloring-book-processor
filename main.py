@@ -1,68 +1,65 @@
-def safe_str(obj):
-    """Convert any object to a safe ASCII string, removing all problematic Unicode."""
-    try:
-        s = str(obj)
-        # Remove specific problematic Unicode characters
-        s = s.replace('\u2028', ' ').replace('\u2029', ' ').replace('\u00a0', ' ')
-        s = s.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')  # Zero-width chars
-        # Keep only ASCII characters
-        return ''.join(char if ord(char) < 128 else '?' for char in s)
-    except:
-        return "Error converting to string"import os
+import os
 import io
 import time
 import base64
 import requests
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response
 import json
 from google.cloud import storage
 from openai import OpenAI
 import re
 from PIL import Image
-import sys
-import codecs
-
-# Force UTF-8 encoding for the entire application
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
-if sys.stderr.encoding != 'utf-8':
-    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+from datetime import timedelta
 
 # --- Config ---
-# NEVER put API keys in code! Use environment variables
 api_key = os.environ.get("OPENAI_API_KEY")
 if not api_key:
     raise ValueError("OPENAI_API_KEY environment variable is required")
 
 client = OpenAI(api_key=api_key)
-# Fixed to match your environment variable name
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
+DEFAULT_PROMPT = (
+    "Convert this photo into a professional adult coloring book page with clean continuous "
+    "black outlines only on a pure white background"
+)
 
-# Keep your optimized prompt but ensure it's ASCII-safe
-DEFAULT_PROMPT = "Convert this photo into a professional adult coloring book page with clean continuous black outlines only on pure white background"
+# Limits
+MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20MB hard cap
+REQUEST_TIMEOUT = 30  # seconds for HTTP GETs
 
 app = Flask(__name__)
 
-# Initialize storage client only if we have credentials
+# Initialize storage client (best-effort)
 try:
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
-    print(f"Connected to GCS bucket: {bucket_name}")
+    print(f"[init] Connected to GCS bucket: {bucket_name}")
 except Exception as e:
-    print(f"GCS not available: {e}")
+    print(f"[init] GCS not available: {e}")
     storage_client = None
     bucket = None
 
 # --- Helpers ---
-def safe_json_response(data, status_code=200):
-    """Create a JSON response that's guaranteed to be ASCII-safe."""
-    # Convert the entire data structure to safe strings
-    safe_data = make_safe_dict(data)
-    json_str = json.dumps(safe_data, ensure_ascii=True, separators=(',', ':'))
-    return Response(json_str, status=status_code, mimetype='application/json')
+def safe_str(obj):
+    """Convert any object to a safe ASCII string, removing problematic Unicode."""
+    try:
+        s = str(obj)
+        # strip separators/zero-width nasties
+        s = (
+            s.replace("\u2028", " ")
+             .replace("\u2029", " ")
+             .replace("\u00a0", " ")
+             .replace("\u200b", "")
+             .replace("\u200c", "")
+             .replace("\u200d", "")
+        )
+        # enforce ASCII
+        return "".join(ch if ord(ch) < 128 else "?" for ch in s)
+    except Exception:
+        return "Error converting to string"
 
 def make_safe_dict(obj):
-    """Recursively make any data structure safe for ASCII JSON."""
+    """Recursively cast arbitraries into ASCII-safe structures for JSON."""
     if isinstance(obj, dict):
         return {safe_str(k): make_safe_dict(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -71,266 +68,194 @@ def make_safe_dict(obj):
         return safe_str(obj)
     else:
         return safe_str(obj)
-    """Convert any object to a safe ASCII string, removing all problematic Unicode."""
-    try:
-        s = str(obj)
-        # Remove specific problematic Unicode characters
-        s = s.replace('\u2028', ' ').replace('\u2029', ' ').replace('\u00a0', ' ')
-        s = s.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')  # Zero-width chars
-        # Keep only ASCII characters
-        return ''.join(char if ord(char) < 128 else '?' for char in s)
-    except:
-        return "Error converting to string"
+
+def safe_json_response(data, status_code=200):
+    safe_data = make_safe_dict(data)
+    json_str = json.dumps(safe_data, ensure_ascii=True, separators=(",", ":"))
+    return Response(json_str, status=status_code, mimetype="application/json")
 
 def sanitize_text(s: str) -> str:
-    """Strip invisible Unicode separators and ensure clean ASCII."""
     return safe_str(s).strip()
 
 def extract_direct_image_url(url: str) -> str:
-    """Extract the actual image URL from UploadKit HTML pages."""
-    # If it's already a direct image URL, return it
-    if url.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp')):
+    """Pull direct image URL from UploadKit HTML pages if needed."""
+    if url.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
         return url
-    
-    # Handle UploadKit HTML download pages
-    if 'uploadkit' in url or 'download.html' in url:
+
+    if "uploadkit" in url or "download.html" in url:
         try:
-            # Download the HTML page
-            resp = requests.get(url, timeout=10)
-            html_content = resp.text
-            
-            # Look for direct image URL in the HTML
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "ColoringBookProcessor/1.0"})
+            resp.raise_for_status()
+            html = resp.text
             patterns = [
-                r'<meta property="og:image" content="([^"]+)"',
-                r'<img[^>]+src="([^"]+)"',
-                r'href="([^"]+\.(jpg|jpeg|png|gif|webp)[^"]*)"'
+                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+                r'<img[^>]+src=["\']([^"\']+)["\']',
+                r'href=["\']([^"\']+\.(?:jpg|jpeg|png|gif|webp)[^"\']*)["\']',
             ]
-            
-            for pattern in patterns:
-                match = re.search(pattern, html_content, re.IGNORECASE)
-                if match:
-                    img_url = match.group(1)
-                    # Make sure it's a full URL
-                    if img_url.startswith('http'):
+            for p in patterns:
+                m = re.search(p, html, re.IGNORECASE)
+                if m:
+                    img_url = m.group(1)
+                    if img_url.startswith("http"):
                         return img_url
-                    elif img_url.startswith('//'):
-                        return 'https:' + img_url
-                    elif img_url.startswith('/'):
-                        base = '/'.join(url.split('/')[:3])
+                    if img_url.startswith("//"):
+                        return "https:" + img_url
+                    if img_url.startswith("/"):
+                        base = "/".join(url.split("/")[:3])
                         return base + img_url
         except Exception as e:
-            print(f"Failed to extract image from HTML: {e}")
-    
+            print(f"[extract] failed to mine HTML: {safe_str(e)}")
     return url
 
 def download_image(url: str) -> bytes:
-    """Download image bytes from a URL."""
-    direct_url = extract_direct_image_url(url)
-    print(f"Downloading from: {direct_url[:100]}...")
-    
+    direct = extract_direct_image_url(url)
+    print(f"[fetch] {direct[:120]}")
+
     headers = {"User-Agent": "ColoringBookProcessor/1.0"}
-    resp = requests.get(direct_url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    
-    content_type = resp.headers.get('content-type', '')
-    if 'text/html' in content_type:
-        raise ValueError(f"Got HTML instead of image from {direct_url[:50]}...")
-    
-    return resp.content
+    with requests.get(direct, headers=headers, timeout=REQUEST_TIMEOUT, stream=True) as r:
+        r.raise_for_status()
+        ct = r.headers.get("content-type", "")
+        if "text/html" in ct.lower():
+            raise ValueError("Got HTML instead of image")
+        # enforce size cap
+        total = 0
+        chunks = []
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                total += len(chunk)
+                if total > MAX_IMAGE_BYTES:
+                    raise ValueError("Image exceeds max size (20MB)")
+                chunks.append(chunk)
+        data = b"".join(chunks)
+    return data
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
     """Send image to OpenAI image edit API and return edited PNG bytes."""
     try:
-        # Clean the image
         img = Image.open(io.BytesIO(image_bytes))
-        
-        # Convert to RGB if necessary
-        if img.mode != 'RGB':
-            if img.mode == 'RGBA':
-                # Create white background
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                background.paste(img, mask=img.split()[3])
-                img = background
-            else:
-                img = img.convert('RGB')
-        
-        # Save as clean PNG
-        clean_img = io.BytesIO()
-        img.save(clean_img, format='PNG')
-        clean_img.seek(0)
-        
-        # Use simple ASCII-only prompt
-        if prompt and len(prompt) > 10:
-            # Ensure prompt is ASCII-safe
-            clean_prompt = sanitize_text(prompt)
-        else:
-            clean_prompt = sanitize_text(DEFAULT_PROMPT)
-        
+        if img.mode == "RGBA":
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[3])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+
+        clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 10) else sanitize_text(DEFAULT_PROMPT)
         if not clean_prompt or len(clean_prompt) < 10:
             clean_prompt = "Convert to line art coloring book page"
-        
-        print(f"Using prompt: {clean_prompt[:50]}...")
-        
-        # Call OpenAI API with URL response format (avoids base64 Unicode issues)
+
+        print(f"[openai] prompt: {clean_prompt[:80]}")
+
+        # Use URL response to avoid base64 headaches
         resp = client.images.edit(
-            model="gpt-image-1",  # Keep your reverse-engineered model
-            image=clean_img,
+            model="gpt-image-1",
+            image=buf,
             prompt=clean_prompt,
             size="1024x1024",
-            response_format="url"  # Get URL instead of base64 to avoid Unicode issues
+            response_format="url",
         )
-        
-        # Download the result from URL
         img_url = resp.data[0].url
-        print(f"Downloading result from OpenAI URL...")
-        img_resp = requests.get(img_url, timeout=30)
+        img_resp = requests.get(img_url, timeout=REQUEST_TIMEOUT)
         img_resp.raise_for_status()
-        
         return img_resp.content
-        
+
     except Exception as e:
-        # Nuclear option for Unicode handling
-        error_msg = safe_str(e)
-        print(f"Error in call_openai_edit: {error_msg}")
-        
-        # Try with simplest possible prompt as fallback
+        print(f"[openai] primary failed: {safe_str(e)}; retrying with minimal prompt")
         try:
-            print("Retrying with minimal prompt...")
-            
             img = Image.open(io.BytesIO(image_bytes))
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            
-            minimal_img = io.BytesIO()
-            img.save(minimal_img, format='PNG')
-            minimal_img.seek(0)
-            
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
             resp = client.images.edit(
-                model="gpt-image-1",  # Keep your reverse-engineered model
-                image=minimal_img,
+                model="gpt-image-1",
+                image=buf,
                 prompt="line art coloring page",
                 size="1024x1024",
-                response_format="url"
+                response_format="url",
             )
-            
             img_url = resp.data[0].url
-            img_resp = requests.get(img_url, timeout=30)
+            img_resp = requests.get(img_url, timeout=REQUEST_TIMEOUT)
+            img_resp.raise_for_status()
             return img_resp.content
-            
         except Exception as e2:
-            error_msg2 = safe_str(e2)
-            print(f"Fallback also failed: {error_msg2}")
-            raise Exception(f"Image processing failed: {error_msg2}")
+            raise Exception(f"Image processing failed: {safe_str(e2)}")
 
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     """Upload PNG to GCS and return signed URL."""
     if not bucket:
-        # If no GCS, return base64 data URL
-        b64 = base64.b64encode(img_bytes).decode('utf-8')
+        # fallback: return data URL preview
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
         return f"data:image/png;base64,{b64}"
-    
+
     blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
     blob = bucket.blob(blob_name)
     blob.upload_from_string(img_bytes, content_type="image/png")
-    
-    # Generate a signed URL that expires in 7 days
-    return blob.generate_signed_url(expiration=604800)
+
+    return blob.generate_signed_url(expiration=timedelta(days=7))  # v4 signed URL
 
 # --- Routes ---
 @app.route("/process", methods=["POST"])
 def process():
-    """Main processing endpoint."""
     try:
-        payload = request.get_json(force=True)
+        payload = request.get_json(force=True) or {}
         order_id = sanitize_text(payload.get("order_id", f"order_{int(time.time())}"))
-        
-        # Handle both 'image_urls' and 'urls' keys
-        image_urls = payload.get("image_urls") or payload.get("urls", [])
-        
-        # If it's a single string, convert to list
+        image_urls = payload.get("image_urls") or payload.get("urls") or []
+
         if isinstance(image_urls, str):
-            image_urls = [url.strip() for url in image_urls.split(',') if url.strip()]
-        
-        # Get and sanitize prompt
+            image_urls = [u.strip() for u in image_urls.split(",") if u.strip()]
+
         raw_prompt = payload.get("prompt", DEFAULT_PROMPT)
         prompt = sanitize_text(raw_prompt) if raw_prompt else DEFAULT_PROMPT
-        
-        print(f"Processing order {order_id} with {len(image_urls)} images")
+
+        print(f"[process] {order_id} - {len(image_urls)} image(s)")
 
         results = []
         for idx, url in enumerate(image_urls):
             try:
-                print(f"Processing image {idx + 1}/{len(image_urls)}")
-                
-                # Download the image
                 raw = download_image(url)
-                print(f"Downloaded {len(raw)} bytes")
-                
-                # Process with OpenAI
+                print(f"[process] downloaded {len(raw)} bytes")
                 edited = call_openai_edit(raw, prompt)
-                print(f"OpenAI processing complete")
-                
-                # Upload to storage
-                if bucket:
-                    signed = upload_to_gcs(order_id, idx, edited)
-                    storage_type = "gcs"
-                else:
-                    # Return base64 if no GCS
-                    signed = base64.b64encode(edited).decode('utf-8')
-                    storage_type = "base64"
-                
+                print(f"[process] openai done -> {len(edited)} bytes")
+                signed = upload_to_gcs(order_id, idx, edited)
                 results.append({
                     "status": "ok",
                     "index": idx,
                     "source_url": url,
                     "result_url": signed if bucket else None,
-                    "result_base64": signed if not bucket else None,
-                    "storage_type": storage_type
+                    "result_base64": None if bucket else signed,  # data URL in no-GCS mode
+                    "storage_type": "gcs" if bucket else "data-url"
                 })
-                
             except Exception as e:
-                # Sanitize error message
-                error_msg = sanitize_text(str(e))
-                print(f"Error processing image {idx}: {error_msg}")
-                results.append({
-                    "status": "error",
-                    "index": idx,
-                    "source_url": url,
-                    "error": error_msg
-                })
+                err = sanitize_text(str(e))
+                print(f"[process] error image {idx}: {err}")
+                results.append({"status": "error", "index": idx, "source_url": url, "error": err})
 
-        # Force ASCII encoding on response
-        safe_prompt = prompt.encode('ascii', 'ignore').decode('ascii')
-        
         return safe_json_response({
             "success": True,
             "count": len(results),
             "order_id": order_id,
-            "prompt_used": safe_prompt[:100],
+            "prompt_used": (prompt.encode("ascii", "ignore").decode("ascii"))[:100],
             "results": results
         })
-        
+
     except Exception as e:
-        # Nuclear Unicode handling
-        error_msg = safe_str(e)
-        print(f"Request failed: {error_msg}")
-        return safe_json_response({
-            "success": False,
-            "error": error_msg
-        }, 500)
+        err = safe_str(e)
+        print(f"[process] request failed: {err}")
+        return safe_json_response({"success": False, "error": err}, 500)
 
 @app.route("/test", methods=["GET", "POST"])
 def test():
-    """Test endpoint with a sample image."""
     test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/320px-Cat03.jpg"
-    
     try:
         raw = download_image(test_url)
         edited = call_openai_edit(raw, "Convert to coloring book page")
-        
-        # Return as base64 for testing
-        b64 = base64.b64encode(edited).decode('utf-8')
-        
+        b64 = base64.b64encode(edited).decode("utf-8")
         return safe_json_response({
             "success": True,
             "message": "Test successful!",
@@ -338,29 +263,21 @@ def test():
             "result_base64_preview": b64[:100] + "...",
             "result_size": len(edited)
         })
-        
     except Exception as e:
-        # Nuclear Unicode handling
-        error_msg = safe_str(e)
-        return safe_json_response({
-            "success": False,
-            "error": error_msg
-        }, 500)
+        return safe_json_response({"success": False, "error": safe_str(e)}, 500)
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint."""
     return safe_json_response({
         "status": "healthy",
         "service": "coloring-book-processor",
         "gcs_available": bucket is not None,
         "openai_configured": api_key is not None,
-        "bucket_name": bucket_name  # Added to verify correct bucket
+        "bucket_name": bucket_name
     })
 
 @app.route("/", methods=["GET"])
 def index():
-    """Root endpoint with usage instructions."""
     return safe_json_response({
         "service": "Coloring Book Processor",
         "endpoints": {
