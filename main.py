@@ -12,6 +12,12 @@ import re
 from PIL import Image
 from datetime import timedelta
 
+# --- Force-disable proxies that break OpenAI client on Cloud Run ---
+for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+    if os.environ.get(_k):
+        print(f"[net] ignoring proxy env {_k}")
+        os.environ.pop(_k, None)
+
 # ---------- OpenAI client (lazy init so /health never crashes) ----------
 client = None
 def get_openai():
@@ -303,3 +309,4 @@ def index():
 if __name__ == "__main__":
     # For local runs only; Cloud Run uses Gunicorn
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
