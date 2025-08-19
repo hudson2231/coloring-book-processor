@@ -8,6 +8,14 @@ from google.cloud import storage
 from openai import OpenAI
 import re
 from PIL import Image
+import sys
+import codecs
+
+# Force UTF-8 encoding for the entire application
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
 
 # --- Config ---
 # NEVER put API keys in code! Use environment variables
@@ -35,14 +43,21 @@ except Exception as e:
     bucket = None
 
 # --- Helpers ---
+def safe_str(obj):
+    """Convert any object to a safe ASCII string, removing all problematic Unicode."""
+    try:
+        s = str(obj)
+        # Remove specific problematic Unicode characters
+        s = s.replace('\u2028', ' ').replace('\u2029', ' ').replace('\u00a0', ' ')
+        s = s.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')  # Zero-width chars
+        # Keep only ASCII characters
+        return ''.join(char if ord(char) < 128 else '?' for char in s)
+    except:
+        return "Error converting to string"
+
 def sanitize_text(s: str) -> str:
     """Strip invisible Unicode separators and ensure clean ASCII."""
-    if not isinstance(s, str):
-        s = str(s)
-    # Remove problematic Unicode characters first
-    s = s.replace('\u2028', ' ').replace('\u2029', ' ').replace('\u00a0', ' ')
-    # Force ASCII encoding
-    return s.encode('ascii', 'ignore').decode('ascii').strip()
+    return safe_str(s).strip()
 
 def extract_direct_image_url(url: str) -> str:
     """Extract the actual image URL from UploadKit HTML pages."""
@@ -147,16 +162,8 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         return img_resp.content
         
     except Exception as e:
-        # More aggressive Unicode handling
-        try:
-            error_str = str(e)
-            # Replace problematic Unicode characters
-            error_str = error_str.replace('\u2028', ' ').replace('\u2029', ' ').replace('\u00a0', ' ')
-            # Remove any other non-ASCII characters
-            error_msg = ''.join(char for char in error_str if ord(char) < 128)
-        except:
-            error_msg = "Unicode error in OpenAI response"
-        
+        # Nuclear option for Unicode handling
+        error_msg = safe_str(e)
         print(f"Error in call_openai_edit: {error_msg}")
         
         # Try with simplest possible prompt as fallback
@@ -184,14 +191,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             return img_resp.content
             
         except Exception as e2:
-            # Same aggressive Unicode handling for fallback
-            try:
-                error_str2 = str(e2)
-                error_str2 = error_str2.replace('\u2028', ' ').replace('\u2029', ' ').replace('\u00a0', ' ')
-                error_msg2 = ''.join(char for char in error_str2 if ord(char) < 128)
-            except:
-                error_msg2 = "Unicode error in OpenAI fallback"
-            
+            error_msg2 = safe_str(e2)
             print(f"Fallback also failed: {error_msg2}")
             raise Exception(f"Image processing failed: {error_msg2}")
 
@@ -313,19 +313,11 @@ def test():
         })
         
     except Exception as e:
-        # Ultra-safe Unicode handling
-        try:
-            error_str = str(e)
-            # Remove all non-ASCII characters completely
-            safe_error = ''.join(char for char in error_str if ord(char) < 128)
-            if not safe_error.strip():
-                safe_error = "Unknown error with special characters"
-        except:
-            safe_error = "Error converting error message"
-        
+        # Nuclear Unicode handling
+        error_msg = safe_str(e)
         return jsonify({
             "success": False,
-            "error": safe_error
+            "error": error_msg
         }), 500
 
 @app.route("/health", methods=["GET"])
