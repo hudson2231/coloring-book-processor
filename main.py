@@ -1,9 +1,20 @@
-import os
+def safe_str(obj):
+    """Convert any object to a safe ASCII string, removing all problematic Unicode."""
+    try:
+        s = str(obj)
+        # Remove specific problematic Unicode characters
+        s = s.replace('\u2028', ' ').replace('\u2029', ' ').replace('\u00a0', ' ')
+        s = s.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')  # Zero-width chars
+        # Keep only ASCII characters
+        return ''.join(char if ord(char) < 128 else '?' for char in s)
+    except:
+        return "Error converting to string"import os
 import io
 import time
 import base64
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, Response
+import json
 from google.cloud import storage
 from openai import OpenAI
 import re
@@ -43,7 +54,23 @@ except Exception as e:
     bucket = None
 
 # --- Helpers ---
-def safe_str(obj):
+def safe_json_response(data, status_code=200):
+    """Create a JSON response that's guaranteed to be ASCII-safe."""
+    # Convert the entire data structure to safe strings
+    safe_data = make_safe_dict(data)
+    json_str = json.dumps(safe_data, ensure_ascii=True, separators=(',', ':'))
+    return Response(json_str, status=status_code, mimetype='application/json')
+
+def make_safe_dict(obj):
+    """Recursively make any data structure safe for ASCII JSON."""
+    if isinstance(obj, dict):
+        return {safe_str(k): make_safe_dict(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [make_safe_dict(item) for item in obj]
+    elif isinstance(obj, str):
+        return safe_str(obj)
+    else:
+        return safe_str(obj)
     """Convert any object to a safe ASCII string, removing all problematic Unicode."""
     try:
         s = str(obj)
@@ -275,7 +302,7 @@ def process():
         # Force ASCII encoding on response
         safe_prompt = prompt.encode('ascii', 'ignore').decode('ascii')
         
-        return jsonify({
+        return safe_json_response({
             "success": True,
             "count": len(results),
             "order_id": order_id,
@@ -284,13 +311,13 @@ def process():
         })
         
     except Exception as e:
-        # Sanitize error message
-        error_msg = sanitize_text(str(e))
+        # Nuclear Unicode handling
+        error_msg = safe_str(e)
         print(f"Request failed: {error_msg}")
-        return jsonify({
+        return safe_json_response({
             "success": False,
             "error": error_msg
-        }), 500
+        }, 500)
 
 @app.route("/test", methods=["GET", "POST"])
 def test():
@@ -304,7 +331,7 @@ def test():
         # Return as base64 for testing
         b64 = base64.b64encode(edited).decode('utf-8')
         
-        return jsonify({
+        return safe_json_response({
             "success": True,
             "message": "Test successful!",
             "original_url": test_url,
@@ -315,15 +342,15 @@ def test():
     except Exception as e:
         # Nuclear Unicode handling
         error_msg = safe_str(e)
-        return jsonify({
+        return safe_json_response({
             "success": False,
             "error": error_msg
-        }), 500
+        }, 500)
 
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint."""
-    return jsonify({
+    return safe_json_response({
         "status": "healthy",
         "service": "coloring-book-processor",
         "gcs_available": bucket is not None,
@@ -334,7 +361,7 @@ def health():
 @app.route("/", methods=["GET"])
 def index():
     """Root endpoint with usage instructions."""
-    return jsonify({
+    return safe_json_response({
         "service": "Coloring Book Processor",
         "endpoints": {
             "/process": "POST - Process images to line art",
