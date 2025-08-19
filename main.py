@@ -39,6 +39,8 @@ def sanitize_text(s: str) -> str:
     """Strip invisible Unicode separators and ensure clean ASCII."""
     if not isinstance(s, str):
         s = str(s)
+    # Remove problematic Unicode characters first
+    s = s.replace('\u2028', ' ').replace('\u2029', ' ').replace('\u00a0', ' ')
     # Force ASCII encoding
     return s.encode('ascii', 'ignore').decode('ascii').strip()
 
@@ -145,7 +147,8 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         return img_resp.content
         
     except Exception as e:
-        error_msg = str(e).encode('ascii', 'ignore').decode('ascii')
+        # Sanitize error message to avoid Unicode issues
+        error_msg = sanitize_text(str(e))
         print(f"Error in call_openai_edit: {error_msg}")
         
         # Try with simplest possible prompt as fallback
@@ -173,7 +176,8 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             return img_resp.content
             
         except Exception as e2:
-            error_msg2 = str(e2).encode('ascii', 'ignore').decode('ascii')
+            # Sanitize second error message too
+            error_msg2 = sanitize_text(str(e2))
             print(f"Fallback also failed: {error_msg2}")
             raise Exception(f"Image processing failed: {error_msg2}")
 
@@ -244,7 +248,8 @@ def process():
                 })
                 
             except Exception as e:
-                error_msg = str(e).encode('ascii', 'ignore').decode('ascii')
+                # Sanitize error message
+                error_msg = sanitize_text(str(e))
                 print(f"Error processing image {idx}: {error_msg}")
                 results.append({
                     "status": "error",
@@ -265,7 +270,8 @@ def process():
         })
         
     except Exception as e:
-        error_msg = str(e).encode('ascii', 'ignore').decode('ascii')
+        # Sanitize error message
+        error_msg = sanitize_text(str(e))
         print(f"Request failed: {error_msg}")
         return jsonify({
             "success": False,
@@ -293,7 +299,8 @@ def test():
         })
         
     except Exception as e:
-        error_msg = str(e).encode('ascii', 'ignore').decode('ascii')
+        # Sanitize error message
+        error_msg = sanitize_text(str(e))
         return jsonify({
             "success": False,
             "error": error_msg
