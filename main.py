@@ -10,7 +10,7 @@ from google.cloud import storage
 from openai import OpenAI
 import re
 from PIL import Image
-from datetime import timedelta
+from datetime import timedelta  # kept for compatibility with existing imports
 
 # --- Force-disable proxies that break OpenAI client on Cloud Run ---
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
@@ -221,14 +221,40 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
+# ---------- Upload helper (no signed URLs; make object public) ----------
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
         return f"data:image/png;base64,{b64}"
+
     blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
     blob = bucket.blob(blob_name)
+
+    # Good CDN/browser caching for immutable artifacts
+    blob.cache_control = "public, max-age=31536000, immutable"
+
+    # Upload bytes
     blob.upload_from_string(img_bytes, content_type="image/png")
-    return blob.generate_signed_url(expiration=timedelta(days=7))
+    # Persist cache headers
+    try:
+        blob.patch()
+    except Exception as e:
+        print(f"[gcs] patch failed: {safe_str(e)}")
+
+    # Try to make object public (works if object ACLs allowed)
+    try:
+        blob.make_public()
+    except Exception as e:
+        print(f"[gcs] make_public failed (likely uniform access/PAP): {safe_str(e)}")
+
+    # Prefer SDK's public URL; fallback to canonical path
+    url = blob.public_url
+    if isinstance(url, bytes):
+        url = url.decode("utf-8", "ignore")
+    if not url or url.startswith("gs://"):
+        url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+
+    return url
 
 # ---------- Routes ----------
 @app.route("/process", methods=["POST"])
@@ -254,13 +280,13 @@ def process():
                 print(f"[process] downloaded {len(raw)} bytes")
                 edited = call_openai_edit(raw, prompt)
                 print(f"[process] openai done -> {len(edited)} bytes")
-                signed = upload_to_gcs(order_id, idx, edited)
+                final_url = upload_to_gcs(order_id, idx, edited)
                 results.append({
                     "status": "ok",
                     "index": idx,
                     "source_url": url,
-                    "result_url": signed if bucket else None,
-                    "result_base64": None if bucket else signed,
+                    "result_url": final_url if bucket else None,
+                    "result_base64": None if bucket else final_url,
                     "storage_type": "gcs" if bucket else "data-url"
                 })
             except Exception as e:
