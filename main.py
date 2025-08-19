@@ -1,3 +1,4 @@
+# model.py
 import os
 import io
 import time
@@ -11,25 +12,31 @@ import re
 from PIL import Image
 from datetime import timedelta
 
-# --- Config ---
-api_key = os.environ.get("OPENAI_API_KEY")
-if not api_key:
-    raise ValueError("OPENAI_API_KEY environment variable is required")
+# ---------- OpenAI client (lazy init so /health never crashes) ----------
+client = None
+def get_openai():
+    global client
+    if client is None:
+        key = os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise RuntimeError("OPENAI_API_KEY not set")
+        client = OpenAI(api_key=key)
+    return client
 
-client = OpenAI(api_key=api_key)
+# ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
 DEFAULT_PROMPT = (
     "Convert this photo into a professional adult coloring book page with clean continuous "
     "black outlines only on a pure white background"
 )
 
-# Limits
-MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20MB hard cap
-REQUEST_TIMEOUT = 30  # seconds for HTTP GETs
+# Limits & timeouts
+MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20MB
+REQUEST_TIMEOUT = 30  # seconds for outbound HTTP
 
 app = Flask(__name__)
 
-# Initialize storage client (best-effort)
+# ---------- GCS client ----------
 try:
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
@@ -39,12 +46,11 @@ except Exception as e:
     storage_client = None
     bucket = None
 
-# --- Helpers ---
+# ---------- Utilities ----------
 def safe_str(obj):
     """Convert any object to a safe ASCII string, removing problematic Unicode."""
     try:
         s = str(obj)
-        # strip separators/zero-width nasties
         s = (
             s.replace("\u2028", " ")
              .replace("\u2029", " ")
@@ -53,7 +59,6 @@ def safe_str(obj):
              .replace("\u200c", "")
              .replace("\u200d", "")
         )
-        # enforce ASCII
         return "".join(ch if ord(ch) < 128 else "?" for ch in s)
     except Exception:
         return "Error converting to string"
@@ -79,10 +84,11 @@ def sanitize_text(s: str) -> str:
 
 def extract_direct_image_url(url: str) -> str:
     """Pull direct image URL from UploadKit HTML pages if needed."""
-    if url.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
+    lower = url.lower()
+    if lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
         return url
 
-    if "uploadkit" in url or "download.html" in url:
+    if "uploadkit" in lower or "download.html" in lower:
         try:
             resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "ColoringBookProcessor/1.0"})
             resp.raise_for_status()
@@ -117,7 +123,6 @@ def download_image(url: str) -> bytes:
         ct = r.headers.get("content-type", "")
         if "text/html" in ct.lower():
             raise ValueError("Got HTML instead of image")
-        # enforce size cap
         total = 0
         chunks = []
         for chunk in r.iter_content(chunk_size=8192):
@@ -150,8 +155,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
 
         print(f"[openai] prompt: {clean_prompt[:80]}")
 
-        # Use URL response to avoid base64 headaches
-        resp = client.images.edit(
+        resp = get_openai().images.edit(
             model="gpt-image-1",
             image=buf,
             prompt=clean_prompt,
@@ -172,7 +176,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             buf.seek(0)
-            resp = client.images.edit(
+            resp = get_openai().images.edit(
                 model="gpt-image-1",
                 image=buf,
                 prompt="line art coloring page",
@@ -187,19 +191,18 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
-    """Upload PNG to GCS and return signed URL."""
+    """Upload PNG to GCS and return signed URL (or data URL if no GCS)."""
     if not bucket:
-        # fallback: return data URL preview
         b64 = base64.b64encode(img_bytes).decode("utf-8")
         return f"data:image/png;base64,{b64}"
 
     blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
     blob = bucket.blob(blob_name)
     blob.upload_from_string(img_bytes, content_type="image/png")
+    # v4 signed URL
+    return blob.generate_signed_url(expiration=timedelta(days=7))
 
-    return blob.generate_signed_url(expiration=timedelta(days=7))  # v4 signed URL
-
-# --- Routes ---
+# ---------- Routes ----------
 @app.route("/process", methods=["POST"])
 def process():
     try:
@@ -272,7 +275,7 @@ def health():
         "status": "healthy",
         "service": "coloring-book-processor",
         "gcs_available": bucket is not None,
-        "openai_configured": api_key is not None,
+        "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
         "bucket_name": bucket_name
     })
 
@@ -298,4 +301,5 @@ def index():
     })
 
 if __name__ == "__main__":
+    # For local runs only; Cloud Run uses Gunicorn
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
