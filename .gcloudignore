@@ -1,0 +1,24 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore Git
+.git/
+.gitignore
+
+# Ignore local/IDE stuff
+*.swp
+.DS_Store
+.env
+
+# Ignore Docker junk
+.docker/
+docker-compose.yml
+Dockerfile
+
+# Ignore venv
+venv/
+.env/
+
+# Ignore large local files
+*.log
