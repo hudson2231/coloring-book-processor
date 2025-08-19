@@ -16,7 +16,8 @@ if not api_key:
     raise ValueError("OPENAI_API_KEY environment variable is required")
 
 client = OpenAI(api_key=api_key)
-bucket_name = os.environ.get("GCS_BUCKET", "coloring-book-results")
+# Fixed to match your environment variable name
+bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
 
 # Keep your optimized prompt but ensure it's ASCII-safe
 DEFAULT_PROMPT = "Convert this photo into a professional adult coloring book page with clean continuous black outlines only on pure white background"
@@ -128,7 +129,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         
         # Call OpenAI API with URL response format (avoids base64 Unicode issues)
         resp = client.images.edit(
-            model="gpt-image-1",
+            model="gpt-image-1",  # Keep your reverse-engineered model
             image=clean_img,
             prompt=clean_prompt,
             size="1024x1024",
@@ -160,7 +161,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             minimal_img.seek(0)
             
             resp = client.images.edit(
-                model="gpt-image-1",
+                model="gpt-image-1",  # Keep your reverse-engineered model
                 image=minimal_img,
                 prompt="line art coloring page",
                 size="1024x1024",
@@ -305,7 +306,8 @@ def health():
         "status": "healthy",
         "service": "coloring-book-processor",
         "gcs_available": bucket is not None,
-        "openai_configured": api_key is not None
+        "openai_configured": api_key is not None,
+        "bucket_name": bucket_name  # Added to verify correct bucket
     })
 
 @app.route("/", methods=["GET"])
