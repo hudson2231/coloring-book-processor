@@ -13,7 +13,7 @@ import io
 import time
 import base64
 import requests
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
 import json
 from google.cloud import storage
 from openai import OpenAI
