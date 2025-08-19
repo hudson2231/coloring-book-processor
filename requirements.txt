@@ -1,4 +1,4 @@
-openai==1.40.0
+openai==1.43.1
 pillow==10.4.0
 requests==2.31.0
 Flask==2.3.3
