@@ -15,5 +15,6 @@ COPY . .
 ENV PORT=8080
 
 # 1 worker, 4 threads is a good baseline on Cloud Run
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 4 --timeout 900 model:app
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 4 --timeout 900 main:app
+
 
