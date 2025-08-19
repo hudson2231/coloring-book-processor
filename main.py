@@ -44,21 +44,12 @@ REQUEST_TIMEOUT = 30  # seconds for outbound HTTP
 
 app = Flask(__name__)
 
-# ---------- GCS client ----------
-try:
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    print(f"[init] Connected to GCS bucket: {bucket_name}")
-except Exception as e:
-    print(f"[init] GCS not available: {e}")
-    storage_client = None
-    bucket = None
-
-# ---------- Utilities ----------
+# ---------- Utilities (Unicode hardening) ----------
 def safe_str(obj):
     """Convert any object to a safe ASCII string, removing problematic Unicode."""
     try:
         s = str(obj)
+        # Replace line/paragraph separators & NBSP
         s = (
             s.replace("\u2028", " ")
              .replace("\u2029", " ")
@@ -67,6 +58,7 @@ def safe_str(obj):
              .replace("\u200c", "")
              .replace("\u200d", "")
         )
+        # Force ASCII-safe
         return "".join(ch if ord(ch) < 128 else "?" for ch in s)
     except Exception:
         return "Error converting to string"
@@ -90,8 +82,20 @@ def safe_json_response(data, status_code=200):
 def sanitize_text(s: str) -> str:
     return safe_str(s).strip()
 
+# ---------- GCS client ----------
+try:
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    print(f"[init] Connected to GCS bucket: {bucket_name}")
+except Exception as e:
+    print(f"[init] GCS not available: {safe_str(e)}")
+    storage_client = None
+    bucket = None
+
+# ---------- Image helpers ----------
 def extract_direct_image_url(url: str) -> str:
     """Pull direct image URL from UploadKit HTML pages if needed."""
+    url = sanitize_text(url)
     lower = url.lower()
     if lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
         return url
@@ -215,11 +219,15 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
 def process():
     try:
         payload = request.get_json(force=True) or {}
-        order_id = sanitize_text(payload.get("order_id", f"order_{int(time.time())}"))
-        image_urls = payload.get("image_urls") or payload.get("urls") or []
 
+        order_id = sanitize_text(payload.get("order_id", f"order_{int(time.time())}"))
+
+        # Accept either "image_urls" or "urls"
+        image_urls = payload.get("image_urls") or payload.get("urls") or []
         if isinstance(image_urls, str):
             image_urls = [u.strip() for u in image_urls.split(",") if u.strip()]
+        # Sanitize all URLs
+        image_urls = [sanitize_text(u) for u in image_urls]
 
         raw_prompt = payload.get("prompt", DEFAULT_PROMPT)
         prompt = sanitize_text(raw_prompt) if raw_prompt else DEFAULT_PROMPT
