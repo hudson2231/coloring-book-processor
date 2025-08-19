@@ -70,8 +70,7 @@ def get_openai():
         key = sanitize_key(raw_key)
         if not key:
             raise RuntimeError("OPENAI_API_KEY not set")
-        # also overwrite env to prevent any library fallback using the raw value
-        os.environ["OPENAI_API_KEY"] = key
+        os.environ["OPENAI_API_KEY"] = key  # overwrite raw env to avoid fallbacks using bad value
         client = OpenAI(api_key=key)
         print(f"[openai] client initialized")
     return client
@@ -115,13 +114,9 @@ def extract_direct_image_url(url: str) -> str:
                 m = re.search(p, html, re.IGNORECASE)
                 if m:
                     img_url = m.group(1)
-                    if img_url.startswith("http"):
-                        return img_url
-                    if img_url.startswith("//"):
-                        return "https:" + img_url
-                    if img_url.startswith("/"):
-                        base = "/".join(url.split("/")[:3])
-                        return base + img_url
+                    if img_url.startswith("http"): return img_url
+                    if img_url.startswith("//"):   return "https:" + img_url
+                    if img_url.startswith("/"):    return "/".join(url.split("/")[:3]) + img_url
         except Exception as e:
             print(f"[extract] failed to mine HTML: {safe_str(e)}")
     return url
@@ -144,7 +139,21 @@ def download_image(url: str) -> bytes:
                 chunks.append(chunk)
     return b"".join(chunks)
 
+def _decode_image_response(resp) -> bytes:
+    """Handle both b64_json and url response shapes."""
+    d = resp.data[0]
+    b64 = getattr(d, "b64_json", None)
+    if b64:
+        return base64.b64decode(b64)
+    url = getattr(d, "url", None)
+    if url:
+        ir = requests.get(url, timeout=REQUEST_TIMEOUT)
+        ir.raise_for_status()
+        return ir.content
+    raise Exception("No image data in response")
+
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
+    """Send image to OpenAI Images API and return edited PNG bytes."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         if img.mode == "RGBA":
@@ -161,22 +170,27 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 10) else sanitize_text(DEFAULT_PROMPT)
         if not clean_prompt or len(clean_prompt) < 10:
             clean_prompt = "Convert to line art coloring book page"
-        # extra belt-and-suspenders: ensure ASCII prompt
-        clean_prompt = clean_prompt.encode("ascii", "ignore").decode("ascii")
+        clean_prompt = clean_prompt.encode("ascii", "ignore").decode("ascii")  # belt & suspenders
 
         print(f"[openai] prompt: {clean_prompt[:80]}")
 
-        resp = get_openai().images.edit(
-            model="gpt-image-1",
-            image=buf,
-            prompt=clean_prompt,
-            size="1024x1024",
-            response_format="url",
-        )
-        img_url = resp.data[0].url
-        img_resp = requests.get(img_url, timeout=REQUEST_TIMEOUT)
-        img_resp.raise_for_status()
-        return img_resp.content
+        # Preferred modern call: edits (plural). Fallback to edit if SDK alias exists.
+        try:
+            resp = get_openai().images.edits(
+                model="gpt-image-1",
+                image=buf,
+                prompt=clean_prompt,
+                size="1024x1024",
+            )
+        except AttributeError:
+            resp = get_openai().images.edit(
+                model="gpt-image-1",
+                image=buf,
+                prompt=clean_prompt,
+                size="1024x1024",
+            )
+
+        return _decode_image_response(resp)
 
     except Exception as e:
         print(f"[openai] primary failed: {safe_str(e)}; retrying with minimal prompt")
@@ -187,17 +201,23 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             buf.seek(0)
-            resp = get_openai().images.edit(
-                model="gpt-image-1",
-                image=buf,
-                prompt="line art coloring page",
-                size="1024x1024",
-                response_format="url",
-            )
-            img_url = resp.data[0].url
-            img_resp = requests.get(img_url, timeout=REQUEST_TIMEOUT)
-            img_resp.raise_for_status()
-            return img_resp.content
+
+            try:
+                resp = get_openai().images.edits(
+                    model="gpt-image-1",
+                    image=buf,
+                    prompt="line art coloring page",
+                    size="1024x1024",
+                )
+            except AttributeError:
+                resp = get_openai().images.edit(
+                    model="gpt-image-1",
+                    image=buf,
+                    prompt="line art coloring page",
+                    size="1024x1024",
+                )
+
+            return _decode_image_response(resp)
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
@@ -216,10 +236,12 @@ def process():
     try:
         payload = request.get_json(force=True) or {}
         order_id = sanitize_text(payload.get("order_id", f"order_{int(time.time())}"))
+
         image_urls = payload.get("image_urls") or payload.get("urls") or []
         if isinstance(image_urls, str):
             image_urls = [u.strip() for u in image_urls.split(",") if u.strip()]
         image_urls = [sanitize_text(u) for u in image_urls]
+
         raw_prompt = payload.get("prompt", DEFAULT_PROMPT)
         prompt = sanitize_text(raw_prompt) if raw_prompt else DEFAULT_PROMPT
 
@@ -258,7 +280,7 @@ def process():
         print(f"[process] request failed: {err}")
         return safe_json_response({"success": False, "error": err}, 500)
 
-@app.route("/test", methods=["GET", "POST"])
+@app.route("/test", methods=["GET", 'POST'])
 def test():
     test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/320px-Cat03.jpg"
     try:
