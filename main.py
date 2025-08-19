@@ -120,9 +120,9 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         # Use simple ASCII-only prompt
         if prompt and len(prompt) > 10:
             # Ensure prompt is ASCII-safe
-            clean_prompt = prompt.encode('ascii', 'ignore').decode('ascii').strip()
+            clean_prompt = sanitize_text(prompt)
         else:
-            clean_prompt = DEFAULT_PROMPT
+            clean_prompt = sanitize_text(DEFAULT_PROMPT)
         
         if not clean_prompt or len(clean_prompt) < 10:
             clean_prompt = "Convert to line art coloring book page"
@@ -147,8 +147,16 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         return img_resp.content
         
     except Exception as e:
-        # Sanitize error message to avoid Unicode issues
-        error_msg = sanitize_text(str(e))
+        # More aggressive Unicode handling
+        try:
+            error_str = str(e)
+            # Replace problematic Unicode characters
+            error_str = error_str.replace('\u2028', ' ').replace('\u2029', ' ').replace('\u00a0', ' ')
+            # Remove any other non-ASCII characters
+            error_msg = ''.join(char for char in error_str if ord(char) < 128)
+        except:
+            error_msg = "Unicode error in OpenAI response"
+        
         print(f"Error in call_openai_edit: {error_msg}")
         
         # Try with simplest possible prompt as fallback
@@ -176,8 +184,14 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             return img_resp.content
             
         except Exception as e2:
-            # Sanitize second error message too
-            error_msg2 = sanitize_text(str(e2))
+            # Same aggressive Unicode handling for fallback
+            try:
+                error_str2 = str(e2)
+                error_str2 = error_str2.replace('\u2028', ' ').replace('\u2029', ' ').replace('\u00a0', ' ')
+                error_msg2 = ''.join(char for char in error_str2 if ord(char) < 128)
+            except:
+                error_msg2 = "Unicode error in OpenAI fallback"
+            
             print(f"Fallback also failed: {error_msg2}")
             raise Exception(f"Image processing failed: {error_msg2}")
 
@@ -299,11 +313,19 @@ def test():
         })
         
     except Exception as e:
-        # Sanitize error message
-        error_msg = sanitize_text(str(e))
+        # Ultra-safe Unicode handling
+        try:
+            error_str = str(e)
+            # Remove all non-ASCII characters completely
+            safe_error = ''.join(char for char in error_str if ord(char) < 128)
+            if not safe_error.strip():
+                safe_error = "Unknown error with special characters"
+        except:
+            safe_error = "Error converting error message"
+        
         return jsonify({
             "success": False,
-            "error": error_msg
+            "error": safe_error
         }), 500
 
 @app.route("/health", methods=["GET"])
