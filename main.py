@@ -3,20 +3,24 @@ import os
 import io
 import time
 import base64
+import re
+import json
 import requests
 from flask import Flask, request, Response
-import json
-from google.cloud import storage
-from openai import OpenAI
-import re
-from PIL import Image
-import httpx  # <-- ensure explicit http client with proxies=None
+from datetime import timedelta
 
-# --- Force-disable proxies that break OpenAI client on Cloud Run ---
+from PIL import Image
+from openai import OpenAI
+
+from google.cloud import storage
+import google.auth
+from google.auth.transport.requests import Request as GARequest
+
+# --- Kill proxies that break outbound calls on Cloud Run ---
 for _k in (
-    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-    "http_proxy", "https_proxy", "all_proxy",
-    "OPENAI_PROXY", "OPENAI_HTTP_PROXY", "OPENAI_HTTPS_PROXY"  # <-- added
+    "HTTP_PROXY","HTTPS_PROXY","ALL_PROXY",
+    "http_proxy","https_proxy","all_proxy",
+    "OPENAI_PROXY","OPENAI_HTTP_PROXY","OPENAI_HTTPS_PROXY"
 ):
     if os.environ.get(_k):
         print(f"[net] ignoring proxy env {_k}")
@@ -31,12 +35,12 @@ def safe_str(obj):
     try:
         s = str(obj)
         s = (
-            s.replace("\u2028", " ")
-             .replace("\u2029", " ")
-             .replace("\u00a0", " ")
-             .replace("\u200b", "")
-             .replace("\u200c", "")
-             .replace("\u200d", "")
+            s.replace("\u2028"," ")
+             .replace("\u2029"," ")
+             .replace("\u00a0"," ")
+             .replace("\u200b","")
+             .replace("\u200c","")
+             .replace("\u200d","")
         )
         return "".join(ch if ord(ch) < 128 else "?" for ch in s)
     except Exception:
@@ -53,7 +57,7 @@ def make_safe_dict(obj):
         return safe_str(obj)
 
 def safe_json_response(data, status_code=200):
-    txt = json.dumps(make_safe_dict(data), ensure_ascii=True, separators=(",", ":"))
+    txt = json.dumps(make_safe_dict(data), ensure_ascii=True, separators=(",",":"))
     return Response(txt, status=status_code, mimetype="application/json")
 
 def sanitize_text(s: str) -> str:
@@ -63,7 +67,7 @@ def sanitize_key(s: str) -> str:
     s = sanitize_text(s)
     return s.replace(" ", "")
 
-# ---------- OpenAI client (lazy init; sanitizes API key) ----------
+# ---------- OpenAI client (lazy init; no proxy args) ----------
 _client = None
 def get_openai():
     global _client
@@ -72,21 +76,9 @@ def get_openai():
         key = sanitize_key(raw_key)
         if not key:
             raise RuntimeError("OPENAI_API_KEY not set")
-
-        # Final belt-and-suspenders: wipe any leftover proxy hints before creating http client
-        for _k in (
-            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-            "http_proxy", "https_proxy", "all_proxy",
-            "OPENAI_PROXY", "OPENAI_HTTP_PROXY", "OPENAI_HTTPS_PROXY"
-        ):
-            os.environ.pop(_k, None)
-        os.environ["NO_PROXY"] = "*"
-        os.environ["no_proxy"] = "*"
-
-        # Explicit httpx client with no proxies so the SDK never tries to pass `proxies=`
-        http_client = httpx.Client(proxies=None, timeout=60.0)
-
-        _client = OpenAI(api_key=key, http_client=http_client)
+        # overwrite env with clean key for any lower-level usages
+        os.environ["OPENAI_API_KEY"] = key
+        _client = OpenAI(api_key=key)
         print("[openai] client initialized")
     return _client
 
@@ -113,11 +105,11 @@ except Exception as e:
 def extract_direct_image_url(url: str) -> str:
     url = sanitize_text(url)
     lower = url.lower()
-    if lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
+    if lower.endswith((".jpg",".jpeg",".png",".gif",".webp")):
         return url
     if "uploadkit" in lower or "download.html" in lower:
         try:
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "ColoringBookProcessor/1.0"})
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent":"ColoringBookProcessor/1.0"})
             resp.raise_for_status()
             html = resp.text
             patterns = [
@@ -139,10 +131,10 @@ def extract_direct_image_url(url: str) -> str:
 def download_image(url: str) -> bytes:
     direct = extract_direct_image_url(url)
     print(f"[fetch] {direct[:120]}")
-    headers = {"User-Agent": "ColoringBookProcessor/1.0"}
+    headers = {"User-Agent":"ColoringBookProcessor/1.0"}
     with requests.get(direct, headers=headers, timeout=REQUEST_TIMEOUT, stream=True) as r:
         r.raise_for_status()
-        ct = (r.headers.get("content-type", "") or "").lower()
+        ct = (r.headers.get("content-type","") or "").lower()
         if "text/html" in ct:
             raise ValueError("Got HTML instead of image")
         total, chunks = 0, []
@@ -155,6 +147,7 @@ def download_image(url: str) -> bytes:
     return b"".join(chunks)
 
 def _decode_image_response(resp) -> bytes:
+    # Supports both b64_json and URL response shapes
     d = resp.data[0]
     b64 = getattr(d, "b64_json", None)
     if b64:
@@ -170,7 +163,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
     try:
         img = Image.open(io.BytesIO(image_bytes))
         if img.mode == "RGBA":
-            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg = Image.new("RGB", img.size, (255,255,255))
             bg.paste(img, mask=img.split()[3])
             img = bg
         elif img.mode != "RGB":
@@ -183,10 +176,9 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 10) else sanitize_text(DEFAULT_PROMPT)
         if not clean_prompt or len(clean_prompt) < 10:
             clean_prompt = "Convert to line art coloring book page"
-        clean_prompt = clean_prompt.encode("ascii", "ignore").decode("ascii")
+        clean_prompt = clean_prompt.encode("ascii","ignore").decode("ascii")
 
         print(f"[openai] prompt: {clean_prompt[:80]}")
-
         try:
             resp = get_openai().images.edits(
                 model="gpt-image-1",
@@ -201,7 +193,6 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
                 prompt=clean_prompt,
                 size="1024x1024",
             )
-
         return _decode_image_response(resp)
 
     except Exception as e:
@@ -213,7 +204,6 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             buf.seek(0)
-
             try:
                 resp = get_openai().images.edits(
                     model="gpt-image-1",
@@ -228,10 +218,40 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
                     prompt="line art coloring page",
                     size="1024x1024",
                 )
-
             return _decode_image_response(resp)
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
+
+# ---------- Upload helper with public+signed fallback ----------
+def _try_make_public(blob):
+    try:
+        blob.make_public()
+        url = blob.public_url
+        if isinstance(url, bytes):
+            url = url.decode("utf-8","ignore")
+        if url and not url.startswith("gs://"):
+            return url
+    except Exception as e:
+        print(f"[gcs] make_public failed: {safe_str(e)}")
+    return None
+
+def _signed_url_v4(blob, minutes=60*24*7):
+    # Use ADC (Compute Engine/Cloud Run) and IAMCredentials signBlob automatically.
+    try:
+        credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        # Refresh if needed
+        if hasattr(credentials, "refresh") and not getattr(credentials, "valid", False):
+            credentials.refresh(GARequest())
+        url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=minutes),
+            method="GET",
+            credentials=credentials,
+        )
+        return url
+    except Exception as e:
+        print(f"[gcs] signed url failed: {safe_str(e)}")
+        return None
 
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
@@ -241,22 +261,27 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
     blob = bucket.blob(blob_name)
     blob.cache_control = "public, max-age=31536000, immutable"
+
     blob.upload_from_string(img_bytes, content_type="image/png")
     try:
         blob.patch()
     except Exception as e:
         print(f"[gcs] patch failed: {safe_str(e)}")
-    try:
-        blob.make_public()
-    except Exception as e:
-        print(f"[gcs] make_public failed (likely uniform access/PAP): {safe_str(e)}")
 
-    url = blob.public_url
-    if isinstance(url, bytes):
-        url = url.decode("utf-8", "ignore")
-    if not url or url.startswith("gs://"):
-        url = f"https://storage.googleapis.com/{bucket.name}/{blob_name}"
-    return url
+    # 1) Try public URL (works if PAP is off & uniform access allows)
+    url = _try_make_public(blob)
+    if url:
+        return url
+
+    # 2) Otherwise, return a V4 signed URL (works even with PAP / uniform access)
+    url = _signed_url_v4(blob, minutes=60*24*7)
+    if url:
+        return url
+
+    # 3) Final fallback: data URL (only if we must)
+    print("[gcs] falling back to data URL")
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
 
 # ---------- Routes ----------
 @app.route("/process", methods=["POST"])
@@ -300,7 +325,7 @@ def process():
             "success": True,
             "count": len(results),
             "order_id": order_id,
-            "prompt_used": (prompt.encode("ascii", "ignore").decode("ascii"))[:100],
+            "prompt_used": (prompt.encode("ascii","ignore").decode("ascii"))[:100],
             "results": results
         })
     except Exception as e:
@@ -308,7 +333,7 @@ def process():
         print(f"[process] request failed: {err}")
         return safe_json_response({"success": False, "error": err}, 500)
 
-@app.route("/test", methods=["GET", "POST"])
+@app.route("/test", methods=["GET","POST"])
 def test():
     test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/320px-Cat03.jpg"
     try:
@@ -358,4 +383,3 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-
