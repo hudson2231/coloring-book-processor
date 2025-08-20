@@ -221,37 +221,37 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
-# ---------- Upload helper (return V4 signed URL; bucket stays private) ----------
+# ---------- Upload helper (SIGNED URLs; no public ACLs) ----------
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
-        # Local/dev fallback: inline data URL
         b64 = base64.b64encode(img_bytes).decode("utf-8")
         return f"data:image/png;base64,{b64}"
 
     blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
     blob = bucket.blob(blob_name)
 
-    # Cache aggressively (immutable artifact)
+    # Good CDN/browser caching for immutable artifacts
     blob.cache_control = "public, max-age=31536000, immutable"
 
-    # Upload the bytes
+    # Upload bytes
     blob.upload_from_string(img_bytes, content_type="image/png")
+    # Persist cache headers (best effort)
     try:
         blob.patch()
     except Exception as e:
         print(f"[gcs] patch failed: {safe_str(e)}")
 
-    # Return a V4 signed URL (works with Public Access Prevention)
+    # Return a time-limited signed URL (v4). No public ACLs.
     try:
         url = blob.generate_signed_url(
             version="v4",
-            expiration=timedelta(days=7),   # adjust if you want shorter
+            expiration=timedelta(days=7),
             method="GET",
         )
         return url
     except Exception as e:
-        # Last-resort fallback (won’t be readable with PAP, but useful for debugging)
-        print(f"[gcs] signed URL failed: {safe_str(e)}")
+        # Fallback: direct path (may not be accessible if bucket/object isn't public)
+        print(f"[gcs] signed URL failed: {safe_str(e)}; falling back to public path")
         return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
 
 # ---------- Routes ----------
