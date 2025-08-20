@@ -10,9 +10,14 @@ from google.cloud import storage
 from openai import OpenAI
 import re
 from PIL import Image
+import httpx  # <-- ensure explicit http client with proxies=None
 
 # --- Force-disable proxies that break OpenAI client on Cloud Run ---
-for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+for _k in (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "all_proxy",
+    "OPENAI_PROXY", "OPENAI_HTTP_PROXY", "OPENAI_HTTPS_PROXY"  # <-- added
+):
     if os.environ.get(_k):
         print(f"[net] ignoring proxy env {_k}")
         os.environ.pop(_k, None)
@@ -67,8 +72,21 @@ def get_openai():
         key = sanitize_key(raw_key)
         if not key:
             raise RuntimeError("OPENAI_API_KEY not set")
-        os.environ["OPENAI_API_KEY"] = key
-        _client = OpenAI(api_key=key)
+
+        # Final belt-and-suspenders: wipe any leftover proxy hints before creating http client
+        for _k in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+            "http_proxy", "https_proxy", "all_proxy",
+            "OPENAI_PROXY", "OPENAI_HTTP_PROXY", "OPENAI_HTTPS_PROXY"
+        ):
+            os.environ.pop(_k, None)
+        os.environ["NO_PROXY"] = "*"
+        os.environ["no_proxy"] = "*"
+
+        # Explicit httpx client with no proxies so the SDK never tries to pass `proxies=`
+        http_client = httpx.Client(proxies=None, timeout=60.0)
+
+        _client = OpenAI(api_key=key, http_client=http_client)
         print("[openai] client initialized")
     return _client
 
@@ -128,7 +146,6 @@ def download_image(url: str) -> bytes:
         if "text/html" in ct:
             raise ValueError("Got HTML instead of image")
         total, chunks = 0, []
-        # FIXED: use iter_content (correct) not itercontent
         for chunk in r.iter_content(chunk_size=8192):
             if chunk:
                 total += len(chunk)
@@ -216,7 +233,6 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
-# ---------- Upload helper: public URL best-effort (works with PAP off) ----------
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -239,7 +255,7 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if isinstance(url, bytes):
         url = url.decode("utf-8", "ignore")
     if not url or url.startswith("gs://"):
-        url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+        url = f"https://storage.googleapis.com/{bucket.name}/{blob_name}"
     return url
 
 # ---------- Routes ----------
@@ -342,3 +358,4 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
