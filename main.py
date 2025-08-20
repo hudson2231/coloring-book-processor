@@ -10,7 +10,6 @@ from google.cloud import storage
 from openai import OpenAI
 import re
 from PIL import Image
-from datetime import timedelta  # kept for compatibility with existing imports
 
 # --- Force-disable proxies that break OpenAI client on Cloud Run ---
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
@@ -24,16 +23,15 @@ app = Flask(__name__)
 
 # ---------- Utilities (Unicode hardening) ----------
 def safe_str(obj):
-    """Convert any object to a safe ASCII string, removing problematic Unicode."""
     try:
         s = str(obj)
         s = (
-            s.replace("\u2028", " ")  # line sep
-             .replace("\u2029", " ")  # paragraph sep
-             .replace("\u00a0", " ")  # NBSP
-             .replace("\u200b", "")   # zero-width space
-             .replace("\u200c", "")   # ZWNJ
-             .replace("\u200d", "")   # ZWJ
+            s.replace("\u2028", " ")
+             .replace("\u2029", " ")
+             .replace("\u00a0", " ")
+             .replace("\u200b", "")
+             .replace("\u200c", "")
+             .replace("\u200d", "")
         )
         return "".join(ch if ord(ch) < 128 else "?" for ch in s)
     except Exception:
@@ -57,23 +55,22 @@ def sanitize_text(s: str) -> str:
     return safe_str(s).strip()
 
 def sanitize_key(s: str) -> str:
-    """Extra strict: remove invisible chars AND spaces from API keys."""
     s = sanitize_text(s)
     return s.replace(" ", "")
 
 # ---------- OpenAI client (lazy init; sanitizes API key) ----------
-client = None
+_client = None
 def get_openai():
-    global client
-    if client is None:
+    global _client
+    if _client is None:
         raw_key = os.environ.get("OPENAI_API_KEY", "")
         key = sanitize_key(raw_key)
         if not key:
             raise RuntimeError("OPENAI_API_KEY not set")
-        os.environ["OPENAI_API_KEY"] = key  # overwrite raw env to avoid fallbacks using bad value
-        client = OpenAI(api_key=key)
-        print(f"[openai] client initialized")
-    return client
+        os.environ["OPENAI_API_KEY"] = key
+        _client = OpenAI(api_key=key)
+        print("[openai] client initialized")
+    return _client
 
 # ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
@@ -131,6 +128,7 @@ def download_image(url: str) -> bytes:
         if "text/html" in ct:
             raise ValueError("Got HTML instead of image")
         total, chunks = 0, []
+        # FIXED: use iter_content (correct) not itercontent
         for chunk in r.iter_content(chunk_size=8192):
             if chunk:
                 total += len(chunk)
@@ -140,7 +138,6 @@ def download_image(url: str) -> bytes:
     return b"".join(chunks)
 
 def _decode_image_response(resp) -> bytes:
-    """Handle both b64_json and url response shapes."""
     d = resp.data[0]
     b64 = getattr(d, "b64_json", None)
     if b64:
@@ -153,7 +150,6 @@ def _decode_image_response(resp) -> bytes:
     raise Exception("No image data in response")
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-    """Send image to OpenAI Images API and return edited PNG bytes."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         if img.mode == "RGBA":
@@ -170,11 +166,10 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 10) else sanitize_text(DEFAULT_PROMPT)
         if not clean_prompt or len(clean_prompt) < 10:
             clean_prompt = "Convert to line art coloring book page"
-        clean_prompt = clean_prompt.encode("ascii", "ignore").decode("ascii")  # belt & suspenders
+        clean_prompt = clean_prompt.encode("ascii", "ignore").decode("ascii")
 
         print(f"[openai] prompt: {clean_prompt[:80]}")
 
-        # Preferred modern call: edits (plural). Fallback to edit if SDK alias exists.
         try:
             resp = get_openai().images.edits(
                 model="gpt-image-1",
@@ -221,7 +216,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
-# ---------- Upload helper (SIGNED URLs; no public ACLs) ----------
+# ---------- Upload helper: public URL best-effort (works with PAP off) ----------
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -229,30 +224,23 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
 
     blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
     blob = bucket.blob(blob_name)
-
-    # Good CDN/browser caching for immutable artifacts
     blob.cache_control = "public, max-age=31536000, immutable"
-
-    # Upload bytes
     blob.upload_from_string(img_bytes, content_type="image/png")
-    # Persist cache headers (best effort)
     try:
         blob.patch()
     except Exception as e:
         print(f"[gcs] patch failed: {safe_str(e)}")
-
-    # Return a time-limited signed URL (v4). No public ACLs.
     try:
-        url = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(days=7),
-            method="GET",
-        )
-        return url
+        blob.make_public()
     except Exception as e:
-        # Fallback: direct path (may not be accessible if bucket/object isn't public)
-        print(f"[gcs] signed URL failed: {safe_str(e)}; falling back to public path")
-        return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+        print(f"[gcs] make_public failed (likely uniform access/PAP): {safe_str(e)}")
+
+    url = blob.public_url
+    if isinstance(url, bytes):
+        url = url.decode("utf-8", "ignore")
+    if not url or url.startswith("gs://"):
+        url = f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+    return url
 
 # ---------- Routes ----------
 @app.route("/process", methods=["POST"])
@@ -304,7 +292,7 @@ def process():
         print(f"[process] request failed: {err}")
         return safe_json_response({"success": False, "error": err}, 500)
 
-@app.route("/test", methods=["GET", 'POST'])
+@app.route("/test", methods=["GET", "POST"])
 def test():
     test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/320px-Cat03.jpg"
     try:
