@@ -12,11 +12,6 @@ import re
 from PIL import Image
 from datetime import timedelta  # kept for compatibility with existing imports
 
-# NEW: imports to enable IAM-based signing (no private key needed)
-import google.auth
-from google.auth.transport.requests import Request
-from google.auth import iam
-
 # --- Force-disable proxies that break OpenAI client on Cloud Run ---
 for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
     if os.environ.get(_k):
@@ -226,72 +221,38 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
-# NEW: helper to acquire an IAM Signer for V4 signed URLs (works on Cloud Run)
-_signer = None
-_sa_email = None
-def _get_iam_signer():
-    global _signer, _sa_email
-    if _signer is not None:
-        return _signer, _sa_email
-    try:
-        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-        # Some creds (e.g., ComputeEngineCredentials) lack service_account_email unless we ask metadata:
-        sa_email = getattr(creds, "service_account_email", None)
-        if not sa_email:
-            # Try metadata (common on Cloud Run)
-            try:
-                from google.auth.compute_engine import _metadata
-                sa_email = _metadata.get_service_account_email()
-            except Exception:
-                sa_email = None
-        signer = iam.Signer(Request(), creds, sa_email) if sa_email else None
-        if signer and sa_email:
-            _signer, _sa_email = signer, sa_email
-            print(f"[gcs] IAM signer ready for {sa_email}")
-            return _signer, _sa_email
-        else:
-            print("[gcs] IAM signer not available (no service account email)")
-            return None, None
-    except Exception as e:
-        print(f"[gcs] failed to init IAM signer: {safe_str(e)}")
-        return None, None
-
-# ---------- Upload helper (now returns V4 **signed URL**) ----------
+# ---------- Upload helper (return V4 signed URL; bucket stays private) ----------
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
+        # Local/dev fallback: inline data URL
         b64 = base64.b64encode(img_bytes).decode("utf-8")
         return f"data:image/png;base64,{b64}"
 
     blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
     blob = bucket.blob(blob_name)
 
-    # Good CDN/browser caching for immutable artifacts
+    # Cache aggressively (immutable artifact)
     blob.cache_control = "public, max-age=31536000, immutable"
 
-    # Upload bytes
+    # Upload the bytes
     blob.upload_from_string(img_bytes, content_type="image/png")
     try:
         blob.patch()
     except Exception as e:
         print(f"[gcs] patch failed: {safe_str(e)}")
 
-    # NEW: generate V4 signed URL using IAM signBlob (no object ACLs, PAP-safe)
-    signer, sa_email = _get_iam_signer()
-    if signer and sa_email:
-        try:
-            url = blob.generate_signed_url(
-                expiration=timedelta(days=7),
-                version="v4",
-                method="GET",
-                credentials=signer,
-                service_account_email=sa_email,
-            )
-            return url
-        except Exception as e:
-            print(f"[gcs] signed URL failed, falling back: {safe_str(e)}")
-
-    # Fallback (may 403 under PAP if you try to access anonymously)
-    return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
+    # Return a V4 signed URL (works with Public Access Prevention)
+    try:
+        url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(days=7),   # adjust if you want shorter
+            method="GET",
+        )
+        return url
+    except Exception as e:
+        # Last-resort fallback (won’t be readable with PAP, but useful for debugging)
+        print(f"[gcs] signed URL failed: {safe_str(e)}")
+        return f"https://storage.googleapis.com/{bucket_name}/{blob_name}"
 
 # ---------- Routes ----------
 @app.route("/process", methods=["POST"])
