@@ -9,9 +9,8 @@ from google.cloud import storage
 from openai import OpenAI
 import re
 from PIL import Image
-import httpx  # explicit HTTP client to control timeouts & proxies
 
-# --- Force-disable proxies that break OpenAI client on Cloud Run ---
+# --- Force-disable proxies that could interfere with OpenAI client on Cloud Run ---
 for _k in (
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
     "http_proxy", "https_proxy", "all_proxy",
@@ -27,16 +26,15 @@ app = Flask(__name__)
 
 # ---------- Utilities (Unicode hardening) ----------
 def safe_str(obj):
-    """Convert any object to a safe ASCII string, removing problematic Unicode."""
     try:
         s = str(obj)
         s = (
-            s.replace("\u2028", " ")  # line sep
-             .replace("\u2029", " ")  # paragraph sep
-             .replace("\u00a0", " ")  # NBSP
-             .replace("\u200b", "")   # zero-width space
-             .replace("\u200c", "")   # ZWNJ
-             .replace("\u200d", "")   # ZWJ
+            s.replace("\u2028", " ")
+             .replace("\u2029", " ")
+             .replace("\u00a0", " ")
+             .replace("\u200b", "")
+             .replace("\u200c", "")
+             .replace("\u200d", "")
         )
         return "".join(ch if ord(ch) < 128 else "?" for ch in s)
     except Exception:
@@ -60,14 +58,12 @@ def sanitize_text(s: str) -> str:
     return safe_str(s).strip()
 
 def sanitize_key(s: str) -> str:
-    """Extra strict: remove invisible chars AND spaces from API keys."""
     s = sanitize_text(s)
     return s.replace(" ", "")
 
 # ---------- OpenAI client (lazy init; sanitizes API key) ----------
 _client = None
 def get_openai():
-    """Singleton OpenAI client with robust, long timeouts."""
     global _client
     if _client is None:
         raw_key = os.environ.get("OPENAI_API_KEY", "")
@@ -75,7 +71,7 @@ def get_openai():
         if not key:
             raise RuntimeError("OPENAI_API_KEY not set")
 
-        # Final belt-and-suspenders: wipe any leftover proxy hints
+        # Ensure no proxy envs are lingering
         for _k in (
             "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
             "http_proxy", "https_proxy", "all_proxy",
@@ -85,17 +81,8 @@ def get_openai():
         os.environ["NO_PROXY"] = "*"
         os.environ["no_proxy"] = "*"
 
-        # >>> ONLY CHANGE: expand OpenAI HTTP timeouts <<<
-        http_client = httpx.Client(
-            proxies=None,
-            timeout=httpx.Timeout(
-                connect=15.0,   # connect / TLS
-                read=300.0,     # server processing + response body
-                write=300.0,    # upload our PNG
-                pool=300.0      # waiting on a pooled connection
-            )
-        )
-        _client = OpenAI(api_key=key, http_client=http_client)
+        # Important: DO NOT pass `proxies` or custom http_client at all.
+        _client = OpenAI(api_key=key)
         print("[openai] client initialized")
     return _client
 
@@ -164,7 +151,6 @@ def download_image(url: str) -> bytes:
     return b"".join(chunks)
 
 def _decode_image_response(resp) -> bytes:
-    """Handle both b64_json and url response shapes."""
     d = resp.data[0]
     b64 = getattr(d, "b64_json", None)
     if b64:
@@ -177,7 +163,6 @@ def _decode_image_response(resp) -> bytes:
     raise Exception("No image data in response")
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-    """Send image to OpenAI Images API and return edited PNG bytes."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         if img.mode == "RGBA":
@@ -196,20 +181,17 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             clean_prompt = "Convert to line art coloring book page"
         clean_prompt = clean_prompt.encode("ascii", "ignore").decode("ascii")
 
-        print(f"[openai] prompt: {clean_prompt[:80]}")
-
-        # >>> ONLY CHANGE: per-request longer timeout for image edit <<<
-        cli = get_openai().with_options(timeout=300.0)
+        print(f"[openai] prompt: {clean_prompt[:120]}")
 
         try:
-            resp = cli.images.edits(
+            resp = get_openai().images.edits(
                 model="gpt-image-1",
                 image=buf,
                 prompt=clean_prompt,
                 size="1024x1024",
             )
         except AttributeError:
-            resp = cli.images.edit(
+            resp = get_openai().images.edit(
                 model="gpt-image-1",
                 image=buf,
                 prompt=clean_prompt,
@@ -228,17 +210,15 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             img.save(buf, format="PNG")
             buf.seek(0)
 
-            # >>> apply the same longer timeout to the fallback call <<<
-            cli = get_openai().with_options(timeout=300.0)
             try:
-                resp = cli.images.edits(
+                resp = get_openai().images.edits(
                     model="gpt-image-1",
                     image=buf,
                     prompt="line art coloring page",
                     size="1024x1024",
                 )
             except AttributeError:
-                resp = cli.images.edit(
+                resp = get_openai().images.edit(
                     model="gpt-image-1",
                     image=buf,
                     prompt="line art coloring page",
@@ -249,6 +229,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
+# ---------- Upload to GCS (public object URL) ----------
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -262,6 +243,8 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
         blob.patch()
     except Exception as e:
         print(f"[gcs] patch failed: {safe_str(e)}")
+
+    # If PAP is off & bucket allows public, this makes it public; if not allowed, we still return the public URL which will 403
     try:
         blob.make_public()
     except Exception as e:
