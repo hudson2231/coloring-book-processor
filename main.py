@@ -9,15 +9,13 @@ from google.cloud import storage
 from openai import OpenAI
 import re
 from PIL import Image
-import httpx
-import google.auth
-from datetime import timedelta
+import httpx  # explicit HTTP client to control timeouts & proxies
 
-# --- Force-disable proxies that can break outbound calls on Cloud Run ---
+# --- Force-disable proxies that break OpenAI client on Cloud Run ---
 for _k in (
-    "HTTP_PROXY","HTTPS_PROXY","ALL_PROXY",
-    "http_proxy","https_proxy","all_proxy",
-    "OPENAI_PROXY","OPENAI_HTTP_PROXY","OPENAI_HTTPS_PROXY"
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "all_proxy",
+    "OPENAI_PROXY", "OPENAI_HTTP_PROXY", "OPENAI_HTTPS_PROXY"
 ):
     if os.environ.get(_k):
         print(f"[net] ignoring proxy env {_k}")
@@ -29,15 +27,16 @@ app = Flask(__name__)
 
 # ---------- Utilities (Unicode hardening) ----------
 def safe_str(obj):
+    """Convert any object to a safe ASCII string, removing problematic Unicode."""
     try:
         s = str(obj)
         s = (
-            s.replace("\u2028", " ")
-             .replace("\u2029", " ")
-             .replace("\u00a0", " ")
-             .replace("\u200b", "")
-             .replace("\u200c", "")
-             .replace("\u200d", "")
+            s.replace("\u2028", " ")  # line sep
+             .replace("\u2029", " ")  # paragraph sep
+             .replace("\u00a0", " ")  # NBSP
+             .replace("\u200b", "")   # zero-width space
+             .replace("\u200c", "")   # ZWNJ
+             .replace("\u200d", "")   # ZWJ
         )
         return "".join(ch if ord(ch) < 128 else "?" for ch in s)
     except Exception:
@@ -61,12 +60,14 @@ def sanitize_text(s: str) -> str:
     return safe_str(s).strip()
 
 def sanitize_key(s: str) -> str:
+    """Extra strict: remove invisible chars AND spaces from API keys."""
     s = sanitize_text(s)
     return s.replace(" ", "")
 
-# ---------- OpenAI client (lazy init; proxy-proof) ----------
+# ---------- OpenAI client (lazy init; sanitizes API key) ----------
 _client = None
 def get_openai():
+    """Singleton OpenAI client with robust, long timeouts."""
     global _client
     if _client is None:
         raw_key = os.environ.get("OPENAI_API_KEY", "")
@@ -74,19 +75,26 @@ def get_openai():
         if not key:
             raise RuntimeError("OPENAI_API_KEY not set")
 
-        # Nuke any leftover proxy hints again
+        # Final belt-and-suspenders: wipe any leftover proxy hints
         for _k in (
-            "HTTP_PROXY","HTTPS_PROXY","ALL_PROXY",
-            "http_proxy","https_proxy","all_proxy",
-            "OPENAI_PROXY","OPENAI_HTTP_PROXY","OPENAI_HTTPS_PROXY"
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+            "http_proxy", "https_proxy", "all_proxy",
+            "OPENAI_PROXY", "OPENAI_HTTP_PROXY", "OPENAI_HTTPS_PROXY"
         ):
             os.environ.pop(_k, None)
         os.environ["NO_PROXY"] = "*"
         os.environ["no_proxy"] = "*"
 
-        # IMPORTANT FIX: don't pass "proxies=" (older httpx rejects it). Use trust_env=False instead.
-        http_client = httpx.Client(trust_env=False, timeout=60.0)
-
+        # >>> ONLY CHANGE: expand OpenAI HTTP timeouts <<<
+        http_client = httpx.Client(
+            proxies=None,
+            timeout=httpx.Timeout(
+                connect=15.0,   # connect / TLS
+                read=300.0,     # server processing + response body
+                write=300.0,    # upload our PNG
+                pool=300.0      # waiting on a pooled connection
+            )
+        )
         _client = OpenAI(api_key=key, http_client=http_client)
         print("[openai] client initialized")
     return _client
@@ -156,6 +164,7 @@ def download_image(url: str) -> bytes:
     return b"".join(chunks)
 
 def _decode_image_response(resp) -> bytes:
+    """Handle both b64_json and url response shapes."""
     d = resp.data[0]
     b64 = getattr(d, "b64_json", None)
     if b64:
@@ -168,6 +177,7 @@ def _decode_image_response(resp) -> bytes:
     raise Exception("No image data in response")
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
+    """Send image to OpenAI Images API and return edited PNG bytes."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         if img.mode == "RGBA":
@@ -188,15 +198,18 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
 
         print(f"[openai] prompt: {clean_prompt[:80]}")
 
+        # >>> ONLY CHANGE: per-request longer timeout for image edit <<<
+        cli = get_openai().with_options(timeout=300.0)
+
         try:
-            resp = get_openai().images.edits(
+            resp = cli.images.edits(
                 model="gpt-image-1",
                 image=buf,
                 prompt=clean_prompt,
                 size="1024x1024",
             )
         except AttributeError:
-            resp = get_openai().images.edit(
+            resp = cli.images.edit(
                 model="gpt-image-1",
                 image=buf,
                 prompt=clean_prompt,
@@ -215,15 +228,17 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             img.save(buf, format="PNG")
             buf.seek(0)
 
+            # >>> apply the same longer timeout to the fallback call <<<
+            cli = get_openai().with_options(timeout=300.0)
             try:
-                resp = get_openai().images.edits(
+                resp = cli.images.edits(
                     model="gpt-image-1",
                     image=buf,
                     prompt="line art coloring page",
                     size="1024x1024",
                 )
             except AttributeError:
-                resp = get_openai().images.edit(
+                resp = cli.images.edit(
                     model="gpt-image-1",
                     image=buf,
                     prompt="line art coloring page",
@@ -234,7 +249,6 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
-# ---------- Upload helper (ALWAYS returns a browser-openable URL) ----------
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -248,21 +262,17 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
         blob.patch()
     except Exception as e:
         print(f"[gcs] patch failed: {safe_str(e)}")
-
-    # V4 SIGNED URL via Cloud Run ADC (no public bucket needed)
     try:
-        creds, _ = google.auth.default()  # service account attached to the service
-        signed = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(days=2),
-            method="GET",
-            credentials=creds,
-        )
-        return signed
+        blob.make_public()
     except Exception as e:
-        # Last-resort fallback to the public URL (may be blocked by PAP; keep for diagnostics)
-        print(f"[gcs] signed URL failed: {safe_str(e)}")
-        return f"https://storage.googleapis.com/{bucket.name}/{blob_name}"
+        print(f"[gcs] make_public failed (likely uniform access/PAP): {safe_str(e)}")
+
+    url = blob.public_url
+    if isinstance(url, bytes):
+        url = url.decode("utf-8", "ignore")
+    if not url or url.startswith("gs://"):
+        url = f"https://storage.googleapis.com/{bucket.name}/{blob_name}"
+    return url
 
 # ---------- Routes ----------
 @app.route("/process", methods=["POST"])
@@ -314,7 +324,7 @@ def process():
         print(f"[process] request failed: {err}")
         return safe_json_response({"success": False, "error": err}, 500)
 
-@app.route("/test", methods=["GET","POST"])
+@app.route("/test", methods=["GET", "POST"])
 def test():
     test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/320px-Cat03.jpg"
     try:
