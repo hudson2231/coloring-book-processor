@@ -9,6 +9,7 @@ from google.cloud import storage
 from openai import OpenAI
 import re
 from PIL import Image
+from typing import Optional
 
 # --- hard kill any proxy env that could affect OpenAI/http ---
 for _k in (
@@ -21,9 +22,7 @@ for _k in (
         os.environ.pop(_k, None)
 os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
-
-VERSION = "cbp-v1.2-no-proxies"
-
+VERSION = "cbp-v1.3-py39-fix"
 app = Flask(__name__)
 
 # ---------- Utilities ----------
@@ -57,19 +56,20 @@ def sanitize_key(s: str) -> str:
     return sanitize_text(s).replace(" ","")
 
 # ---------- OpenAI (NO custom http client, NO proxies arg) ----------
-_openai_client = None
+openai_client = None
+
 def get_openai():
-    global _openai_client
-    if _openai_client is None:
+    global openai_client
+    if openai_client is None:
         key = sanitize_key(os.environ.get("OPENAI_API_KEY",""))
         if not key:
             raise RuntimeError("OPENAI_API_KEY not set")
         # ensure env seen by SDK
         os.environ["OPENAI_API_KEY"] = key
         # IMPORTANT: vanilla init (no httpx, no proxies kw)
-        _openai_client = OpenAI()
+        openai_client = OpenAI()
         print("[openai] client initialized (no proxies)")
-    return _openai_client
+    return openai_client
 
 # ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
@@ -94,7 +94,7 @@ except Exception as e:
 UA_BROWSER = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 BASE_HEADERS = {"User-Agent": UA_BROWSER, "Accept": "*/*"}
 
-def _mine_html_for_image(html: str, page_url: str) -> str | None:
+def mine_html_for_image(html: str, page_url: str) -> Optional[str]:
     patterns = [
         r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
         r'<img[^>]+srcset=["\']([^"\']+)["\']',
@@ -120,7 +120,7 @@ def extract_direct_image_url(url: str) -> str:
     try:
         resp = requests.get(url, headers=BASE_HEADERS, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200 and "text/html" in resp.headers.get("content-type","").lower():
-            mined = _mine_html_for_image(resp.text, url)
+            mined = mine_html_for_image(resp.text, url)
             if mined: return mined
     except Exception as e:
         print(f"[extract] failed to mine HTML: {safe_str(e)}")
@@ -132,6 +132,7 @@ def download_image(url: str) -> bytes:
     headers = dict(BASE_HEADERS)
     # Some CDNs require a referer (UploadKit/Shopify flows)
     headers["Referer"] = "https://shopify.com/"
+    
     # First attempt
     with requests.get(direct, headers=headers, timeout=REQUEST_TIMEOUT, stream=True, allow_redirects=True) as r:
         if r.status_code in (401,403):
@@ -148,7 +149,7 @@ def download_image(url: str) -> bytes:
         if "text/html" in ct:
             # Final attempt to mine inside HTML
             html = r.text
-            mined = _mine_html_for_image(html, direct)
+            mined = mine_html_for_image(html, direct)
             if not mined:
                 raise ValueError("Got HTML instead of image")
             r.close()
@@ -163,7 +164,7 @@ def download_image(url: str) -> bytes:
                 chunks.append(chunk)
     return b"".join(chunks)
 
-def _decode_image_response(resp) -> bytes:
+def decode_image_response(resp) -> bytes:
     d = resp.data[0]
     b64 = getattr(d, "b64_json", None)
     if b64:
@@ -187,17 +188,17 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         buf.seek(0)
-
+        
         clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 10) else sanitize_text(DEFAULT_PROMPT)
         if not clean_prompt or len(clean_prompt) < 10:
             clean_prompt = "Convert to line art coloring book page"
         clean_prompt = clean_prompt.encode("ascii","ignore").decode("ascii")
         print(f"[openai] prompt: {clean_prompt[:80]}")
-
+        
         client = get_openai()
         # Try modern plural API; fall back to singular
         try:
-            resp = client.images.edits(
+            resp = client.images.edit(
                 model="gpt-image-1",
                 image=buf,
                 prompt=clean_prompt,
@@ -210,8 +211,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
                 prompt=clean_prompt,
                 size="1024x1024",
             )
-        return _decode_image_response(resp)
-
+        return decode_image_response(resp)
     except Exception as e:
         print(f"[openai] primary failed: {safe_str(e)}; retrying with minimal prompt")
         try:
@@ -222,21 +222,13 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             img.save(buf, format="PNG")
             buf.seek(0)
             client = get_openai()
-            try:
-                resp = client.images.edits(
-                    model="gpt-image-1",
-                    image=buf,
-                    prompt="line art coloring page",
-                    size="1024x1024",
-                )
-            except AttributeError:
-                resp = client.images.edit(
-                    model="gpt-image-1",
-                    image=buf,
-                    prompt="line art coloring page",
-                    size="1024x1024",
-                )
-            return _decode_image_response(resp)
+            resp = client.images.edit(
+                model="gpt-image-1",
+                image=buf,
+                prompt="line art coloring page",
+                size="1024x1024",
+            )
+            return decode_image_response(resp)
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
@@ -244,6 +236,7 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
         return f"data:image/png;base64,{b64}"
+    
     blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
     blob = bucket.blob(blob_name)
     blob.cache_control = "public, max-age=31536000, immutable"
@@ -256,6 +249,7 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
         blob.make_public()
     except Exception as e:
         print(f"[gcs] make_public failed (likely uniform access/PAP): {safe_str(e)}")
+    
     url = blob.public_url
     if isinstance(url, bytes):
         url = url.decode("utf-8", "ignore")
@@ -269,17 +263,17 @@ def process():
     try:
         payload = request.get_json(force=True) or {}
         order_id = sanitize_text(payload.get("order_id", f"order_{int(time.time())}"))
-
+        
         image_urls = payload.get("image_urls") or payload.get("urls") or []
         if isinstance(image_urls, str):
             image_urls = [u.strip() for u in image_urls.split(",") if u.strip()]
         image_urls = [sanitize_text(u) for u in image_urls]
-
+        
         raw_prompt = payload.get("prompt", DEFAULT_PROMPT)
         prompt = sanitize_text(raw_prompt) if raw_prompt else DEFAULT_PROMPT
-
+        
         print(f"[process] {order_id} - {len(image_urls)} image(s)")
-
+        
         results = []
         for idx, url in enumerate(image_urls):
             try:
@@ -300,7 +294,7 @@ def process():
                 err = sanitize_text(str(e))
                 print(f"[process] error image {idx}: {err}")
                 results.append({"status":"error","index":idx,"source_url":url,"error":err})
-
+        
         return safe_json_response({
             "success": True,
             "count": len(results),
