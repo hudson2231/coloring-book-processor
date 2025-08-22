@@ -189,8 +189,8 @@ def call_openai_edit_rest(image_png_bytes: bytes, prompt: str) -> bytes:
     data = {
         "model": "gpt-image-1",  # Keep your reverse-engineered model name
         "prompt": prompt,
-        "size": "1024x1024",
-        "response_format": "url"  # Get URL to avoid base64 issues
+        "size": "1024x1024"
+        # Removed response_format - not supported by this endpoint/model
     }
     headers = {
         "Authorization": f"Bearer {api_key}"
