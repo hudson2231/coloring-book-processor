@@ -66,15 +66,18 @@ def get_api_key() -> str:
 # ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
 
-# PERFECT coloring book prompt - locked and loaded
-PERFECT_COLORING_PROMPT = (
-    "Transform this into a high-quality adult coloring book page. "
-    "Create bold, clean black outlines with 3-4 pixel thickness on pure white background. "
-    "Remove all colors, gradients, shadows, and textures - keep only essential black line art. "
-    "Make all outlines continuous and fully closed for easy coloring. "
-    "Simplify complex details while preserving main recognizable features. "
-    "Ensure smooth, well-defined lines perfect for colored pencils, markers, or crayons. "
-    "Style should be professional adult coloring book quality with clear, separated sections."
+# ULTIMATE coloring book prompt - based on perfect examples
+ULTIMATE_COLORING_PROMPT = (
+    "Convert this photograph into a premium adult coloring book illustration with the following precise specifications: "
+    "Create bold, consistent black outlines with 2-3 pixel line weight throughout. "
+    "Preserve ALL details from the original image including backgrounds, architectural elements, food items, objects, and environmental context. "
+    "Maintain accurate representation of all subjects - do not change or simplify recognizable objects. "
+    "Include rich background details such as ceiling fixtures, wall elements, furniture, other people, and environmental context. "
+    "Remove all colors, shadows, gradients, and photographic textures while keeping every structural and object detail. "
+    "Ensure all outlines are continuous, closed, and suitable for coloring with markers or colored pencils. "
+    "Style should match high-end adult coloring books with complex, engaging detail levels. "
+    "Use pure white background with crisp black line art only. "
+    "Preserve facial features, expressions, clothing details, and all recognizable elements accurately."
 )
 
 # Book sizing - standard coloring book dimensions
@@ -242,10 +245,10 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
         
-        # ALWAYS use the perfect prompt - ignore any custom prompts
-        final_prompt = PERFECT_COLORING_PROMPT
+        # ALWAYS use the ULTIMATE prompt - ignore any custom prompts
+        final_prompt = ULTIMATE_COLORING_PROMPT
         
-        print(f"[openai] processing with PERFECT prompt for coloring book...")
+        print(f"[openai] processing with ULTIMATE prompt for perfect coloring book quality...")
         
         return call_openai_edit_rest(png_bytes, final_prompt)
         
@@ -259,7 +262,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             
-            return call_openai_edit_rest(buf.getvalue(), "Transform into clean black line art coloring book page on white background")
+            return call_openai_edit_rest(buf.getvalue(), "Convert to detailed line art coloring book preserving all background and object details")
             
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
@@ -360,7 +363,7 @@ def process():
             "successful_images": total_success,
             "failed_images": len(image_urls) - total_success,
             "order_id": order_id,
-            "prompt_used": "PERFECT_COLORING_PROMPT (locked)",
+            "prompt_used": "ULTIMATE_COLORING_PROMPT (detail-preserving)",
             "image_size": COLORING_BOOK_SIZE,
             "results": results
         })
