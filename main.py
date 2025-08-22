@@ -65,12 +65,24 @@ def get_api_key() -> str:
 
 # ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
-DEFAULT_PROMPT = (
-    "Convert this photo into a professional adult coloring book page with clean continuous "
-    "black outlines only on a pure white background"
+
+# PERFECT coloring book prompt - locked and loaded
+PERFECT_COLORING_PROMPT = (
+    "Transform this into a high-quality adult coloring book page. "
+    "Create bold, clean black outlines with 3-4 pixel thickness on pure white background. "
+    "Remove all colors, gradients, shadows, and textures - keep only essential black line art. "
+    "Make all outlines continuous and fully closed for easy coloring. "
+    "Simplify complex details while preserving main recognizable features. "
+    "Ensure smooth, well-defined lines perfect for colored pencils, markers, or crayons. "
+    "Style should be professional adult coloring book quality with clear, separated sections."
 )
+
+# Book sizing - standard coloring book dimensions
+COLORING_BOOK_SIZE = "1024x1024"  # Square format works well for books
+MAX_IMAGES_PER_ORDER = 24
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = 45  # Increased for multiple images
+OPENAI_TIMEOUT = 600  # 10 minutes for complex processing
 
 # ---------- GCS client ----------
 try:
@@ -189,21 +201,21 @@ def call_openai_edit_rest(image_png_bytes: bytes, prompt: str) -> bytes:
     data = {
         "model": "gpt-image-1",  # Keep your reverse-engineered model name
         "prompt": prompt,
-        "size": "1024x1024"
+        "size": COLORING_BOOK_SIZE  # Use standardized book size
         # Removed response_format - not supported by this endpoint/model
     }
     headers = {
         "Authorization": f"Bearer {api_key}"
     }
     
-    print(f"[openai-rest] calling edit API with prompt: {prompt[:50]}...")
+    print(f"[openai-rest] calling edit API for {COLORING_BOOK_SIZE}...")
     
     response = session.post(
         f"{OPENAI_API_BASE}/images/edits",
         headers=headers,
         data=data,
         files=files,
-        timeout=(10, 300)  # 10s connect, 300s read
+        timeout=(15, OPENAI_TIMEOUT)  # 15s connect, up to 10min read for complex images
     )
     
     if response.status_code != 200:
@@ -230,26 +242,24 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
         
-        clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 10) else sanitize_text(DEFAULT_PROMPT)
-        if not clean_prompt or len(clean_prompt) < 10:
-            clean_prompt = "Convert to line art coloring book page"
-        clean_prompt = clean_prompt.encode("ascii","ignore").decode("ascii")
+        # ALWAYS use the perfect prompt - ignore any custom prompts
+        final_prompt = PERFECT_COLORING_PROMPT
         
-        print(f"[openai] processing with prompt: {clean_prompt[:80]}")
+        print(f"[openai] processing with PERFECT prompt for coloring book...")
         
-        return call_openai_edit_rest(png_bytes, clean_prompt)
+        return call_openai_edit_rest(png_bytes, final_prompt)
         
     except Exception as e:
-        print(f"[openai] primary failed: {safe_str(e)}; retrying with minimal prompt")
+        print(f"[openai] primary failed: {safe_str(e)}; retrying with fallback")
         try:
-            # Try again with minimal prompt
+            # Try again with simplified fallback
             img = Image.open(io.BytesIO(image_bytes))
             if img.mode != "RGB":
                 img = img.convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             
-            return call_openai_edit_rest(buf.getvalue(), "line art coloring page")
+            return call_openai_edit_rest(buf.getvalue(), "Transform into clean black line art coloring book page on white background")
             
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
@@ -291,42 +301,73 @@ def process():
             image_urls = [u.strip() for u in image_urls.split(",") if u.strip()]
         image_urls = [sanitize_text(u) for u in image_urls]
         
-        raw_prompt = payload.get("prompt", DEFAULT_PROMPT)
-        prompt = sanitize_text(raw_prompt) if raw_prompt else DEFAULT_PROMPT
+        # Validate image count
+        if len(image_urls) > MAX_IMAGES_PER_ORDER:
+            return safe_json_response({
+                "success": False, 
+                "error": f"Too many images. Maximum {MAX_IMAGES_PER_ORDER} per order."
+            }, 400)
         
-        print(f"[process] {order_id} - {len(image_urls)} image(s)")
+        if not image_urls:
+            return safe_json_response({
+                "success": False, 
+                "error": "No image URLs provided"
+            }, 400)
+        
+        # Ignore any custom prompt - we use the perfect one
+        print(f"[process] {order_id} - processing {len(image_urls)} image(s) with PERFECT prompt")
         
         results = []
+        total_success = 0
+        
         for idx, url in enumerate(image_urls):
             try:
+                print(f"[process] Processing image {idx + 1}/{len(image_urls)}")
+                
                 raw = download_image(url)
-                print(f"[process] downloaded {len(raw)} bytes")
-                edited = call_openai_edit(raw, prompt)
-                print(f"[process] openai done -> {len(edited)} bytes")
+                print(f"[process] Downloaded {len(raw)} bytes for image {idx + 1}")
+                
+                edited = call_openai_edit(raw, "")  # Empty prompt since we override it
+                print(f"[process] OpenAI processing complete for image {idx + 1} -> {len(edited)} bytes")
+                
                 final_url = upload_to_gcs(order_id, idx, edited)
+                print(f"[process] Uploaded image {idx + 1} to: {final_url[:100]}...")
+                
                 results.append({
-                    "status": "ok",
+                    "status": "success",
                     "index": idx,
                     "source_url": url,
                     "result_url": final_url if bucket else None,
                     "result_base64": None if bucket else final_url,
-                    "storage_type": "gcs" if bucket else "data-url"
+                    "storage_type": "gcs" if bucket else "data-url",
+                    "size": COLORING_BOOK_SIZE
                 })
+                total_success += 1
+                
             except Exception as e:
                 err = sanitize_text(str(e))
-                print(f"[process] error image {idx}: {err}")
-                results.append({"status":"error","index":idx,"source_url":url,"error":err})
+                print(f"[process] ERROR processing image {idx + 1}: {err}")
+                results.append({
+                    "status": "error",
+                    "index": idx,
+                    "source_url": url,
+                    "error": err
+                })
         
         return safe_json_response({
             "success": True,
-            "count": len(results),
+            "total_images": len(image_urls),
+            "successful_images": total_success,
+            "failed_images": len(image_urls) - total_success,
             "order_id": order_id,
-            "prompt_used": (prompt.encode("ascii","ignore").decode("ascii"))[:100],
+            "prompt_used": "PERFECT_COLORING_PROMPT (locked)",
+            "image_size": COLORING_BOOK_SIZE,
             "results": results
         })
+        
     except Exception as e:
         err = safe_str(e)
-        print(f"[process] request failed: {err}")
+        print(f"[process] Request failed: {err}")
         return safe_json_response({"success": False, "error": err}, 500)
 
 @app.route("/test", methods=["GET","POST"])
