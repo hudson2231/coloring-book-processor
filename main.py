@@ -6,7 +6,6 @@ import requests
 from flask import Flask, request, Response
 import json
 from google.cloud import storage
-from openai import OpenAI
 import re
 from PIL import Image
 from typing import Optional
@@ -55,21 +54,14 @@ def sanitize_text(s: str) -> str:
 def sanitize_key(s: str) -> str:
     return sanitize_text(s).replace(" ","")
 
-# ---------- OpenAI (NO custom http client, NO proxies arg) ----------
-openai_client = None
+# ---------- OpenAI REST API (bypass SDK completely) ----------
+OPENAI_API_BASE = "https://api.openai.com/v1"
 
-def get_openai():
-    global openai_client
-    if openai_client is None:
-        key = sanitize_key(os.environ.get("OPENAI_API_KEY",""))
-        if not key:
-            raise RuntimeError("OPENAI_API_KEY not set")
-        # ensure env seen by SDK
-        os.environ["OPENAI_API_KEY"] = key
-        # IMPORTANT: vanilla init (no httpx, no proxies kw)
-        openai_client = OpenAI()
-        print("[openai] client initialized (no proxies)")
-    return openai_client
+def get_api_key() -> str:
+    key = sanitize_key(os.environ.get("OPENAI_API_KEY",""))
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    return key
 
 # ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
@@ -164,20 +156,68 @@ def download_image(url: str) -> bytes:
                 chunks.append(chunk)
     return b"".join(chunks)
 
-def decode_image_response(resp) -> bytes:
-    d = resp.data[0]
-    b64 = getattr(d, "b64_json", None)
-    if b64:
-        return base64.b64decode(b64)
-    url = getattr(d, "url", None)
-    if url:
-        ir = requests.get(url, headers=BASE_HEADERS, timeout=REQUEST_TIMEOUT)
-        ir.raise_for_status()
-        return ir.content
-    raise Exception("No image data in response")
+def decode_image_response(response_json) -> bytes:
+    data = response_json.get("data", [])
+    if not data:
+        raise Exception("No data in OpenAI response")
+    
+    item = data[0]
+    
+    # Try b64_json first
+    if "b64_json" in item and item["b64_json"]:
+        return base64.b64decode(item["b64_json"])
+    
+    # Try URL
+    if "url" in item and item["url"]:
+        img_resp = requests.get(item["url"], headers=BASE_HEADERS, timeout=REQUEST_TIMEOUT)
+        img_resp.raise_for_status()
+        return img_resp.content
+    
+    raise Exception("No image data found in OpenAI response")
+
+def call_openai_edit_rest(image_png_bytes: bytes, prompt: str) -> bytes:
+    """Call OpenAI images/edit API directly via REST, no SDK."""
+    api_key = get_api_key()
+    
+    # Create a session with no proxy environment variables
+    session = requests.Session()
+    session.trust_env = False  # Ignore all proxy env vars
+    
+    files = {
+        "image": ("image.png", image_png_bytes, "image/png")
+    }
+    data = {
+        "model": "gpt-image-1",  # Keep your reverse-engineered model name
+        "prompt": prompt,
+        "size": "1024x1024",
+        "response_format": "url"  # Get URL to avoid base64 issues
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    print(f"[openai-rest] calling edit API with prompt: {prompt[:50]}...")
+    
+    response = session.post(
+        f"{OPENAI_API_BASE}/images/edits",
+        headers=headers,
+        data=data,
+        files=files,
+        timeout=(10, 300)  # 10s connect, 300s read
+    )
+    
+    if response.status_code != 200:
+        try:
+            error_info = response.json()
+        except:
+            error_info = {"error": {"message": response.text}}
+        raise Exception(f"OpenAI API error {response.status_code}: {safe_str(error_info)}")
+    
+    return decode_image_response(response.json())
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
     try:
+        # Normalize image to PNG (RGB on white background if RGBA)
         img = Image.open(io.BytesIO(image_bytes))
         if img.mode == "RGBA":
             bg = Image.new("RGB", img.size, (255,255,255))
@@ -185,50 +225,32 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             img = bg
         elif img.mode != "RGB":
             img = img.convert("RGB")
+        
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        buf.seek(0)
+        png_bytes = buf.getvalue()
         
         clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 10) else sanitize_text(DEFAULT_PROMPT)
         if not clean_prompt or len(clean_prompt) < 10:
             clean_prompt = "Convert to line art coloring book page"
         clean_prompt = clean_prompt.encode("ascii","ignore").decode("ascii")
-        print(f"[openai] prompt: {clean_prompt[:80]}")
         
-        client = get_openai()
-        # Try modern plural API; fall back to singular
-        try:
-            resp = client.images.edit(
-                model="gpt-image-1",
-                image=buf,
-                prompt=clean_prompt,
-                size="1024x1024",
-            )
-        except AttributeError:
-            resp = client.images.edit(
-                model="gpt-image-1",
-                image=buf,
-                prompt=clean_prompt,
-                size="1024x1024",
-            )
-        return decode_image_response(resp)
+        print(f"[openai] processing with prompt: {clean_prompt[:80]}")
+        
+        return call_openai_edit_rest(png_bytes, clean_prompt)
+        
     except Exception as e:
         print(f"[openai] primary failed: {safe_str(e)}; retrying with minimal prompt")
         try:
+            # Try again with minimal prompt
             img = Image.open(io.BytesIO(image_bytes))
             if img.mode != "RGB":
                 img = img.convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="PNG")
-            buf.seek(0)
-            client = get_openai()
-            resp = client.images.edit(
-                model="gpt-image-1",
-                image=buf,
-                prompt="line art coloring page",
-                size="1024x1024",
-            )
-            return decode_image_response(resp)
+            
+            return call_openai_edit_rest(buf.getvalue(), "line art coloring page")
+            
         except Exception as e2:
             raise Exception(f"Image processing failed: {safe_str(e2)}")
 
