@@ -21,7 +21,7 @@ for _k in (
         os.environ.pop(_k, None)
 os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
-VERSION = "cbp-v1.3-py39-fix"
+VERSION = "cbp-v2.0-dalle2-test"
 app = Flask(__name__)
 
 # ---------- Utilities ----------
@@ -54,7 +54,30 @@ def sanitize_text(s: str) -> str:
 def sanitize_key(s: str) -> str:
     return sanitize_text(s).replace(" ","")
 
-# ---------- OpenAI REST API (bypass SDK completely) ----------
+# ---------- Config ----------
+bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
+
+# DALL-E 2 optimized coloring book prompt
+DALLE2_COLORING_PROMPT = (
+    "Convert this photograph into a premium adult coloring book illustration. "
+    "Create bold, consistent black outlines with 2-3 pixel thickness on pure white background. "
+    "Preserve ALL facial features accurately - maintain proper proportions, expressions, and recognizable details. "
+    "Include rich background elements like architectural details, furniture, other people, and environmental context. "
+    "Maintain accurate representation of all objects - do not change food items, drinks, or other recognizable elements. "
+    "Remove all colors, shadows, and photographic textures while preserving structural details. "
+    "Ensure all outlines are continuous, closed, and perfect for coloring with markers or colored pencils. "
+    "Style should match professional adult coloring books with engaging detail levels."
+)
+
+# Model and sizing configuration  
+MODEL_NAME = "dall-e-2"  # Official OpenAI model
+COLORING_BOOK_SIZE = "1024x1024"
+MAX_IMAGES_PER_ORDER = 24
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+REQUEST_TIMEOUT = 45
+OPENAI_TIMEOUT = 600
+
+# ---------- OpenAI REST API ----------
 OPENAI_API_BASE = "https://api.openai.com/v1"
 
 def get_api_key() -> str:
@@ -62,30 +85,6 @@ def get_api_key() -> str:
     if not key:
         raise RuntimeError("OPENAI_API_KEY not set")
     return key
-
-# ---------- Config ----------
-bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
-
-# ULTIMATE coloring book prompt - based on perfect examples
-ULTIMATE_COLORING_PROMPT = (
-    "Convert this photograph into a premium adult coloring book illustration with the following precise specifications: "
-    "Create bold, consistent black outlines with 2-3 pixel line weight throughout. "
-    "Preserve ALL details from the original image including backgrounds, architectural elements, food items, objects, and environmental context. "
-    "Maintain accurate representation of all subjects - do not change or simplify recognizable objects. "
-    "Include rich background details such as ceiling fixtures, wall elements, furniture, other people, and environmental context. "
-    "Remove all colors, shadows, gradients, and photographic textures while keeping every structural and object detail. "
-    "Ensure all outlines are continuous, closed, and suitable for coloring with markers or colored pencils. "
-    "Style should match high-end adult coloring books with complex, engaging detail levels. "
-    "Use pure white background with crisp black line art only. "
-    "Preserve facial features, expressions, clothing details, and all recognizable elements accurately."
-)
-
-# Book sizing - standard coloring book dimensions
-COLORING_BOOK_SIZE = "1024x1024"  # Square format works well for books
-MAX_IMAGES_PER_ORDER = 24
-MAX_IMAGE_BYTES = 20 * 1024 * 1024
-REQUEST_TIMEOUT = 45  # Increased for multiple images
-OPENAI_TIMEOUT = 600  # 10 minutes for complex processing
 
 # ---------- GCS client ----------
 try:
@@ -190,8 +189,8 @@ def decode_image_response(response_json) -> bytes:
     
     raise Exception("No image data found in OpenAI response")
 
-def call_openai_edit_rest(image_png_bytes: bytes, prompt: str) -> bytes:
-    """Call OpenAI images/edit API directly via REST, no SDK."""
+def call_dalle2_edit(image_png_bytes: bytes, prompt: str) -> bytes:
+    """Call DALL-E 2 images/edit API directly via REST."""
     api_key = get_api_key()
     
     # Create a session with no proxy environment variables
@@ -202,23 +201,23 @@ def call_openai_edit_rest(image_png_bytes: bytes, prompt: str) -> bytes:
         "image": ("image.png", image_png_bytes, "image/png")
     }
     data = {
-        "model": "gpt-image-1",  # Keep your reverse-engineered model name
+        "model": MODEL_NAME,
         "prompt": prompt,
-        "size": COLORING_BOOK_SIZE  # Use standardized book size
-        # Removed response_format - not supported by this endpoint/model
+        "size": COLORING_BOOK_SIZE,
+        "n": 1
     }
     headers = {
         "Authorization": f"Bearer {api_key}"
     }
     
-    print(f"[openai-rest] calling edit API for {COLORING_BOOK_SIZE}...")
+    print(f"[dalle2] calling edit API with {MODEL_NAME} for {COLORING_BOOK_SIZE}...")
     
     response = session.post(
         f"{OPENAI_API_BASE}/images/edits",
         headers=headers,
         data=data,
         files=files,
-        timeout=(15, OPENAI_TIMEOUT)  # 15s connect, up to 10min read for complex images
+        timeout=(15, OPENAI_TIMEOUT)
     )
     
     if response.status_code != 200:
@@ -226,7 +225,7 @@ def call_openai_edit_rest(image_png_bytes: bytes, prompt: str) -> bytes:
             error_info = response.json()
         except:
             error_info = {"error": {"message": response.text}}
-        raise Exception(f"OpenAI API error {response.status_code}: {safe_str(error_info)}")
+        raise Exception(f"DALL-E 2 API error {response.status_code}: {safe_str(error_info)}")
     
     return decode_image_response(response.json())
 
@@ -245,15 +244,15 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
         
-        # ALWAYS use the ULTIMATE prompt - ignore any custom prompts
-        final_prompt = ULTIMATE_COLORING_PROMPT
+        # ALWAYS use the DALL-E 2 optimized prompt
+        final_prompt = DALLE2_COLORING_PROMPT
         
-        print(f"[openai] processing with ULTIMATE prompt for perfect coloring book quality...")
+        print(f"[dalle2] processing with optimized DALL-E 2 prompt...")
         
-        return call_openai_edit_rest(png_bytes, final_prompt)
+        return call_dalle2_edit(png_bytes, final_prompt)
         
     except Exception as e:
-        print(f"[openai] primary failed: {safe_str(e)}; retrying with fallback")
+        print(f"[dalle2] primary failed: {safe_str(e)}; retrying with simplified prompt")
         try:
             # Try again with simplified fallback
             img = Image.open(io.BytesIO(image_bytes))
@@ -262,10 +261,10 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             
-            return call_openai_edit_rest(buf.getvalue(), "Convert to detailed line art coloring book preserving all background and object details")
+            return call_dalle2_edit(buf.getvalue(), "Transform into clean black line art coloring book page preserving facial features and background details")
             
         except Exception as e2:
-            raise Exception(f"Image processing failed: {safe_str(e2)}")
+            raise Exception(f"DALL-E 2 processing failed: {safe_str(e2)}")
 
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
@@ -317,8 +316,7 @@ def process():
                 "error": "No image URLs provided"
             }, 400)
         
-        # Ignore any custom prompt - we use the perfect one
-        print(f"[process] {order_id} - processing {len(image_urls)} image(s) with PERFECT prompt")
+        print(f"[process] {order_id} - processing {len(image_urls)} image(s) with DALL-E 2 model")
         
         results = []
         total_success = 0
@@ -331,7 +329,7 @@ def process():
                 print(f"[process] Downloaded {len(raw)} bytes for image {idx + 1}")
                 
                 edited = call_openai_edit(raw, "")  # Empty prompt since we override it
-                print(f"[process] OpenAI processing complete for image {idx + 1} -> {len(edited)} bytes")
+                print(f"[process] DALL-E 2 processing complete for image {idx + 1} -> {len(edited)} bytes")
                 
                 final_url = upload_to_gcs(order_id, idx, edited)
                 print(f"[process] Uploaded image {idx + 1} to: {final_url[:100]}...")
@@ -363,7 +361,8 @@ def process():
             "successful_images": total_success,
             "failed_images": len(image_urls) - total_success,
             "order_id": order_id,
-            "prompt_used": "ULTIMATE_COLORING_PROMPT (detail-preserving)",
+            "prompt_used": "DALLE2_COLORING_PROMPT (facial accuracy focused)",
+            "model_used": MODEL_NAME,
             "image_size": COLORING_BOOK_SIZE,
             "results": results
         })
@@ -382,10 +381,11 @@ def test():
         b64 = base64.b64encode(edited).decode("utf-8")
         return safe_json_response({
             "success": True,
-            "message": "Test successful!",
+            "message": "DALL-E 2 test successful!",
             "original_url": test_url,
             "result_base64_preview": b64[:100] + "...",
-            "result_size": len(edited)
+            "result_size": len(edited),
+            "model_used": MODEL_NAME
         })
     except Exception as e:
         return safe_json_response({"success": False, "error": safe_str(e)}, 500)
@@ -398,13 +398,16 @@ def health():
         "gcs_available": bucket is not None,
         "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
         "bucket_name": bucket_name,
-        "version": VERSION
+        "version": VERSION,
+        "model": MODEL_NAME
     })
 
 @app.route("/", methods=["GET"])
 def index():
     return safe_json_response({
         "service": "Coloring Book Processor",
+        "version": VERSION,
+        "model": MODEL_NAME,
         "endpoints": {
             "/process": "POST - Process images to line art",
             "/test": "GET/POST - Test with sample image",
@@ -417,7 +420,7 @@ def index():
             "body": {
                 "order_id": "order_123",
                 "urls": ["https://example.com/image1.jpg"],
-                "prompt": "Convert to coloring book page"
+                "prompt": "ignored - using DALL-E 2 optimized prompt"
             }
         }
     })
