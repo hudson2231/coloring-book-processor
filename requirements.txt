@@ -1,5 +1,4 @@
 pillow==10.4.0
-pillow-heif==0.10.1
 requests==2.31.0
 Flask==2.3.3
 gunicorn==21.2.0
