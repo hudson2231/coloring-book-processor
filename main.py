@@ -46,6 +46,23 @@ PROMPTS = {
         "Generate black line art illustration: 2-3px line weight, closed paths, "
         "facial accuracy priority, preserve background context, "
         "remove photographic textures, coloring book style"
+    ),
+    
+    "LINE_ART_FOCUSED": (
+        "Convert this photograph to black line art coloring book illustration. "
+        "REMOVE ALL COLORS, SHADOWS, AND PHOTOGRAPHIC TEXTURES completely. "
+        "Create bold black outlines ONLY on pure white background. "
+        "Maintain all facial features and background details exactly as shown "
+        "but render as clean line drawing suitable for coloring with markers. "
+        "No shading, no gradients, no photorealistic elements - ONLY black lines on white."
+    ),
+    
+    "ULTRA_LINE_ART": (
+        "Transform to pure black and white line art coloring book page. "
+        "Remove every trace of color, shadow, texture, and photographic detail. "
+        "Convert all elements to simple black outlines on white background. "
+        "Preserve facial recognition and object details but render as line drawing only. "
+        "Final result must look like hand-drawn coloring book illustration."
     )
 }
 
