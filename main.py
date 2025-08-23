@@ -10,21 +10,12 @@ import re
 from PIL import Image
 from typing import Optional
 
-# Enable HEIC support if available
-try:
-    from PIL import ImageFile
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
-    # Try to import pillow-heif for HEIC support
-    try:
-        import pillow_heif
-        pillow_heif.register_heif_opener()
-        print("[init] HEIC support enabled")
-    except ImportError:
-        print("[init] pillow-heif not available - will convert HEIC via alternate method")
-except Exception as e:
-    print(f"[init] Image support setup: {e}")
+# Enable basic PIL features
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+print("[init] PIL truncated image support enabled")
 
-VERSION = "cbp-v4.0-business-critical"
+VERSION = "cbp-v4.1-build-fix"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
