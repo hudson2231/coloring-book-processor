@@ -57,18 +57,23 @@ PROMPTS = {
         "No shading, no gradients, no photorealistic elements - ONLY black lines on white."
     ),
     
-    "ULTRA_LINE_ART": (
-        "Transform to pure black and white line art coloring book page. "
-        "Remove every trace of color, shadow, texture, and photographic detail. "
-        "Convert all elements to simple black outlines on white background. "
-        "Preserve facial recognition and object details but render as line drawing only. "
-        "Final result must look like hand-drawn coloring book illustration."
+    "ULTIMATE_PERFECT": (
+        "Convert to professional adult coloring book line art with these EXACT specifications: "
+        "BOLD 3-pixel consistent black outlines throughout entire image on pure white background. "
+        "PRESERVE facial features with perfect accuracy - maintain exact expressions, eye shape, smile, proportions. "
+        "CAPTURE every small detail: jewelry chains, necklaces, earrings, clothing textures, hair definition. "
+        "INTERPRET dark/shadowy background areas as clear structural line elements - ceiling details, wall features, other people as line drawings. "
+        "ENSURE all lines are SHARP and CRISP - no soft, blurry, or faded outlines anywhere. "
+        "CONVERT photographic lighting and shadows into drawable line art elements - not darkness. "
+        "MAINTAIN rich environmental context with clear line-drawn background elements. "
+        "CREATE closed, continuous outlines perfect for coloring with markers or colored pencils. "
+        "RENDER as hand-drawn professional coloring book illustration quality."
     )
 }
 
-# Get prompt strategy from environment (default to DETAILED)
-PROMPT_STRATEGY = os.environ.get("PROMPT_STRATEGY", "DETAILED")
-SELECTED_PROMPT = PROMPTS.get(PROMPT_STRATEGY, PROMPTS["DETAILED"])
+# Get prompt strategy from environment (default to LINE_ART_FOCUSED)
+PROMPT_STRATEGY = os.environ.get("PROMPT_STRATEGY", "LINE_ART_FOCUSED")
+SELECTED_PROMPT = PROMPTS.get(PROMPT_STRATEGY, PROMPTS["LINE_ART_FOCUSED"])
 
 # ---------- Enhanced Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
@@ -312,7 +317,7 @@ def _rest_image_edit(image_png: bytes, prompt: str, attempt: int = 1) -> bytes:
         raise Exception(f"OpenAI request failed after {attempt} attempts: {safe_str(e)}")
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-    # Enhanced image preprocessing
+    # Enhanced image preprocessing with error handling
     try:
         img = Image.open(io.BytesIO(image_bytes))
         original_size = img.size
@@ -328,7 +333,7 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         elif img.mode != "RGB":
             img = img.convert("RGB")
         
-        # Optimize image size for processing (maintain aspect ratio)
+        # Keep original size optimization - NO sharpening filter
         max_dimension = 1024
         if max(img.size) > max_dimension:
             ratio = max_dimension / max(img.size)
@@ -336,15 +341,22 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
             img = img.resize(new_size, Image.Resampling.LANCZOS)
             print(f"[openai] resized to {new_size[0]}x{new_size[1]} for processing")
         
-        # Save with high quality
+        # Save with standard quality - no fancy compression
         buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
+        img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
+        
+        # Validate the saved image can be read back
+        try:
+            test_img = Image.open(io.BytesIO(png_bytes))
+            test_img.verify()
+        except Exception as e:
+            raise Exception(f"Generated PNG is corrupted: {safe_str(e)}")
         
         # Use selected prompt strategy
         clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 10) else SELECTED_PROMPT
         if not clean_prompt or len(clean_prompt) < 5:
-            clean_prompt = PROMPTS["MINIMAL"]
+            clean_prompt = PROMPTS["LINE_ART_FOCUSED"]  # Back to working prompt
         
         # Ensure ASCII encoding
         clean_prompt = clean_prompt.encode("ascii", "ignore").decode("ascii")
@@ -355,22 +367,23 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
     except Exception as e:
         print(f"[openai] primary processing failed: {safe_str(e)}")
         
-        # Fallback with minimal prompt
+        # More robust fallback
         try:
-            img = Image.open(io.BytesIO(image_bytes))
-            if img.mode != "RGB":
-                if img.mode == "RGBA":
-                    bg = Image.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
+            # Try to process original bytes directly
+            test_img = Image.open(io.BytesIO(image_bytes))
+            if test_img.mode != "RGB":
+                if test_img.mode == "RGBA":
+                    bg = Image.new("RGB", test_img.size, (255, 255, 255))
+                    bg.paste(test_img, mask=test_img.split()[3])
+                    test_img = bg
                 else:
-                    img = img.convert("RGB")
+                    test_img = test_img.convert("RGB")
             
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
+            fallback_buf = io.BytesIO()
+            test_img.save(fallback_buf, format="PNG")
             
-            print("[openai] retrying with minimal prompt")
-            return _rest_image_edit(buf.getvalue(), PROMPTS["MINIMAL"])
+            print("[openai] fallback processing with minimal prompt")
+            return _rest_image_edit(fallback_buf.getvalue(), "Convert to bold line art coloring book with sharp details")
             
         except Exception as e2:
             raise Exception(f"Image processing failed completely: {safe_str(e2)}")
