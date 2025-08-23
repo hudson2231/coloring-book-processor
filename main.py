@@ -231,23 +231,30 @@ def call_dalle2_edit(image_png_bytes: bytes, prompt: str) -> bytes:
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
     try:
-        # Normalize image to PNG (RGB on white background if RGBA)
+        # DALL-E 2 requires RGBA format for editing
         img = Image.open(io.BytesIO(image_bytes))
-        if img.mode == "RGBA":
-            bg = Image.new("RGB", img.size, (255,255,255))
-            bg.paste(img, mask=img.split()[3])
-            img = bg
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
+        
+        # Convert to RGBA (with alpha channel) for DALL-E 2
+        if img.mode != "RGBA":
+            # Create RGBA version
+            if img.mode == "RGB":
+                # Add full opacity alpha channel
+                img = img.convert("RGBA")
+            elif img.mode in ("L", "LA"):
+                # Grayscale to RGBA
+                img = img.convert("RGBA")
+            else:
+                # Any other mode to RGBA
+                img = img.convert("RGBA")
         
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        img.save(buf, format="PNG")  # PNG preserves RGBA
         png_bytes = buf.getvalue()
         
         # ALWAYS use the DALL-E 2 optimized prompt
         final_prompt = DALLE2_COLORING_PROMPT
         
-        print(f"[dalle2] processing with optimized DALL-E 2 prompt...")
+        print(f"[dalle2] processing RGBA image with optimized DALL-E 2 prompt...")
         
         return call_dalle2_edit(png_bytes, final_prompt)
         
@@ -256,8 +263,8 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
         try:
             # Try again with simplified fallback
             img = Image.open(io.BytesIO(image_bytes))
-            if img.mode != "RGB":
-                img = img.convert("RGB")
+            if img.mode != "RGBA":
+                img = img.convert("RGBA")
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             
