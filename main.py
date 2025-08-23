@@ -190,15 +190,23 @@ def decode_image_response(response_json) -> bytes:
     raise Exception("No image data found in OpenAI response")
 
 def call_dalle2_edit(image_png_bytes: bytes, prompt: str) -> bytes:
-    """Call DALL-E 2 images/edit API directly via REST."""
+    """Call DALL-E 2 images/edit API directly via REST with full-image mask."""
     api_key = get_api_key()
     
     # Create a session with no proxy environment variables
     session = requests.Session()
     session.trust_env = False  # Ignore all proxy env vars
     
+    # Create full white mask (edit entire image)
+    img = Image.open(io.BytesIO(image_png_bytes))
+    mask = Image.new("RGBA", img.size, (255, 255, 255, 255))  # Full white mask
+    mask_buffer = io.BytesIO()
+    mask.save(mask_buffer, format="PNG")
+    mask_bytes = mask_buffer.getvalue()
+    
     files = {
-        "image": ("image.png", image_png_bytes, "image/png")
+        "image": ("image.png", image_png_bytes, "image/png"),
+        "mask": ("mask.png", mask_bytes, "image/png")
     }
     data = {
         "model": MODEL_NAME,
@@ -210,7 +218,7 @@ def call_dalle2_edit(image_png_bytes: bytes, prompt: str) -> bytes:
         "Authorization": f"Bearer {api_key}"
     }
     
-    print(f"[dalle2] calling edit API with {MODEL_NAME} for {COLORING_BOOK_SIZE}...")
+    print(f"[dalle2] calling edit API with {MODEL_NAME} + full mask for {COLORING_BOOK_SIZE}...")
     
     response = session.post(
         f"{OPENAI_API_BASE}/images/edits",
