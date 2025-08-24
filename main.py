@@ -187,7 +187,7 @@ def _rest_image_edit(image_png: bytes, prompt: str) -> bytes:
     return _decode_image_json(resp.json())
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-    """Convert image to line art using OpenAI, with robust HEIC support"""
+    """Convert image to line art using OpenAI, with HEIC support via imageio"""
     img = None
     
     # Enhanced HEIC detection - check multiple signatures
@@ -201,27 +201,26 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
     
     print(f"[image] Processing image, size: {len(image_bytes)} bytes, HEIC detected: {is_heic}")
     
-    # Try to open the image with HEIC support first
+    # Try to open the image with HEIC support using imageio
     if is_heic:
-        print("[heic] HEIC/HEIF file detected, processing...")
+        print("[heic] HEIC/HEIF file detected, processing with imageio...")
         try:
-            # Import and register HEIF support
-            import pillow_heif
-            pillow_heif.register_heif_opener()
-            
-            # Open the HEIC file
-            img = Image.open(io.BytesIO(image_bytes))
-            print(f"[heic] Successfully opened HEIC file: {img.size[0]}x{img.size[1]} pixels, mode: {img.mode}")
+            import imageio.v3 as iio
+            # Use imageio to read HEIC files
+            image_array = iio.imread(io.BytesIO(image_bytes))
+            img = Image.fromarray(image_array)
+            print(f"[heic] Successfully opened HEIC file with imageio: {img.size[0]}x{img.size[1]} pixels, mode: {img.mode}")
             
         except ImportError as e:
-            print(f"[heic] pillow-heif not available: {safe_str(e)}")
+            print(f"[heic] imageio not available: {safe_str(e)}")
             raise ValueError(
                 "HEIC files require special processing libraries that are not available. "
                 "Please convert your HEIC image to JPG format and try again."
             )
         except Exception as e:
-            print(f"[heic] Failed to process HEIC file: {safe_str(e)}")
-            raise ValueError(f"Unable to process HEIC file: {safe_str(e)}")
+            print(f"[heic] Failed to process HEIC file with imageio: {safe_str(e)}")
+            # Fall back to standard PIL as a last resort
+            print("[heic] Attempting fallback to standard PIL...")
     
     # If not HEIC or HEIC processing failed, try standard PIL
     if not img:
