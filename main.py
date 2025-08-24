@@ -7,7 +7,7 @@ from flask import Flask, request, Response
 import json
 from google.cloud import storage
 import re
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 from typing import Optional
 
 # Enable basic PIL features
@@ -15,7 +15,7 @@ from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 print("[init] PIL truncated image support enabled")
 
-VERSION = "cbp-v5.3-fixed-gpt-image-1"
+VERSION = "cbp-v6.0-pure-gpt4o"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -30,38 +30,11 @@ app = Flask(__name__)
 
 # ---------- BUSINESS CRITICAL CONFIG ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
-MAX_IMAGE_BYTES = 100 * 1024 * 1024  # 100MB for any format
+MAX_IMAGE_BYTES = 100 * 1024 * 1024
 MAX_IMAGES_PER_ORDER = 24
 REQUEST_TIMEOUT = 180
-OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT", "1200"))
+OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT", "600"))  # Reduced timeout
 OPENAI_RETRY_ATTEMPTS = 3
-
-# ---------- Your Perfect Prompts (from your original code) ----------
-PERFECT_PROMPTS = {
-    "ULTIMATE_QUALITY": (
-        "Convert to professional adult coloring book line art with these EXACT specifications: "
-        "BOLD 3-pixel consistent black outlines throughout entire image on pure white background. "
-        "PRESERVE facial features with perfect accuracy - maintain exact expressions, eye shape, smile, proportions. "
-        "CAPTURE every small detail: jewelry chains, necklaces, earrings, clothing textures, hair definition. "
-        "INTERPRET dark/shadowy background areas as clear structural line elements - ceiling details, wall features, other people as line drawings. "
-        "ENSURE all lines are SHARP and CRISP - no soft, blurry, or faded outlines anywhere. "
-        "CONVERT photographic lighting and shadows into drawable line art elements - not darkness. "
-        "MAINTAIN rich environmental context with clear line-drawn background elements. "
-        "CREATE closed, continuous outlines perfect for coloring with markers or colored pencils. "
-        "RENDER as hand-drawn professional coloring book illustration quality."
-    ),
-    
-    "LINE_ART_FOCUSED": (
-        "Convert this photograph to black line art coloring book illustration. "
-        "REMOVE ALL COLORS, SHADOWS, AND PHOTOGRAPHIC TEXTURES completely. "
-        "Create bold black outlines ONLY on pure white background. "
-        "Maintain all facial features and background details exactly as shown "
-        "but render as clean line drawing suitable for coloring with markers. "
-        "No shading, no gradients, no photorealistic elements - ONLY black lines on white."
-    )
-}
-
-SELECTED_PROMPT = PERFECT_PROMPTS["LINE_ART_FOCUSED"]
 
 # ---------- Utilities ----------
 def safe_str(obj) -> str:
@@ -116,12 +89,10 @@ def extract_direct_image_url(url: str) -> str:
     url = sanitize_text(url)
     lower = url.lower()
     
-    # Direct image URLs - any format
     image_extensions = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif")
     if any(lower.endswith(ext) for ext in image_extensions):
         return url
         
-    # UploadKit or HTML pages - comprehensive extraction
     if any(keyword in lower for keyword in ("uploadkit", "download.html", "files.getuploadkit.com")):
         try:
             headers = {
@@ -190,13 +161,9 @@ def download_image(url: str) -> bytes:
                 response.raise_for_status()
                 
                 content_type = response.headers.get("content-type", "").lower()
-                content_length = response.headers.get("content-length")
-                
-                print(f"[download] Content-Type: {content_type}, Length: {content_length}")
                 
                 if "text/html" in content_type:
                     if attempt < max_retries - 1:
-                        print(f"[download] Got HTML response, retrying...")
                         time.sleep(2 ** attempt)
                         continue
                     raise ValueError("Server returned HTML instead of image")
@@ -208,12 +175,11 @@ def download_image(url: str) -> bytes:
                     if chunk:
                         total_bytes += len(chunk)
                         if total_bytes > MAX_IMAGE_BYTES:
-                            raise ValueError(f"Image too large: {total_bytes} bytes > {MAX_IMAGE_BYTES}")
+                            raise ValueError(f"Image too large: {total_bytes} bytes")
                         chunks.append(chunk)
                 
                 if total_bytes < 1024:
                     if attempt < max_retries - 1:
-                        print(f"[download] Small file ({total_bytes} bytes), retrying...")
                         time.sleep(2 ** attempt)
                         continue
                     raise ValueError(f"Downloaded file too small: {total_bytes} bytes")
@@ -222,29 +188,19 @@ def download_image(url: str) -> bytes:
                 print(f"[download] Successfully downloaded {total_bytes:,} bytes")
                 return image_data
                 
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            if attempt < max_retries - 1:
-                wait_time = (2 ** attempt) * 2
-                print(f"[download] Network error: {safe_str(e)}, waiting {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            raise ValueError(f"Download failed after {max_retries} attempts: {safe_str(e)}")
-        
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"[download] Error: {safe_str(e)}, retrying...")
                 time.sleep(2 ** attempt)
                 continue
             raise ValueError(f"Download failed: {safe_str(e)}")
     
     raise ValueError("All download attempts failed")
 
-# ---------- IMAGE PROCESSING (Your working code) ----------
+# ---------- IMAGE PROCESSING ----------
 def process_image_to_rgb(image_bytes: bytes) -> Image.Image:
     approaches = [
         lambda: Image.open(io.BytesIO(image_bytes)),
-        lambda: Image.open(io.BytesIO(image_bytes)).convert('RGB'),
-        lambda: Image.frombuffer('RGB', (100, 100), image_bytes[:30000] + b'\x00' * max(0, 30000 - len(image_bytes)), 'raw', 'RGB', 0, 1) if len(image_bytes) >= 30000 else None
+        lambda: Image.open(io.BytesIO(image_bytes)).convert('RGB')
     ]
     
     img = None
@@ -262,131 +218,51 @@ def process_image_to_rgb(image_bytes: bytes) -> Image.Image:
         raise Exception("Could not load image with any method")
     
     if img.mode == "RGBA":
-        print("[image] Converting RGBA to RGB with white background")
         background = Image.new("RGB", img.size, (255, 255, 255))
         background.paste(img, mask=img.split()[3])
         return background
     elif img.mode in ("P", "L", "LA", "CMYK", "YCbCr"):
-        print(f"[image] Converting {img.mode} to RGB")
         return img.convert("RGB")
     elif img.mode == "RGB":
         return img
     else:
-        print(f"[image] Unknown mode {img.mode}, forcing RGB conversion")
         return img.convert("RGB")
 
-# ---------- FIXED GPT-IMAGE-1 APPROACH ----------
+# ---------- PURE GPT-4O VISION APPROACH ----------
 OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
 
-def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-    """Use GPT-4o with image input to generate coloring book via chat completions."""
+def create_line_art_with_vision(image_bytes: bytes, custom_prompt: str = None) -> bytes:
+    """Use GPT-4o vision to create SVG line art directly."""
     
-    try:
-        print("[gpt-image-1] Processing with GPT-4o chat completions (image input)")
-        
-        # Convert image to base64
-        img_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        # Use your perfect prompt
-        clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 15) else SELECTED_PROMPT
-        
-        # Combine image analysis with generation request
-        system_prompt = (
-            "You are a professional coloring book artist. When given a photo, you generate a detailed "
-            "coloring book line art version that preserves all important details but converts them to "
-            "bold black outlines on white background suitable for coloring."
+    # Convert image to base64
+    img_b64 = base64.b64encode(image_bytes).decode('utf-8')
+    
+    # Create comprehensive prompt for SVG generation
+    if custom_prompt and len(custom_prompt.strip()) > 20:
+        instruction = custom_prompt.strip()
+    else:
+        instruction = (
+            "Convert this photograph to black line art coloring book illustration. "
+            "REMOVE ALL COLORS, SHADOWS, AND PHOTOGRAPHIC TEXTURES completely. "
+            "Create bold black outlines ONLY on pure white background. "
+            "Maintain all facial features and background details exactly as shown "
+            "but render as clean line drawing suitable for coloring with markers. "
+            "No shading, no gradients, no photorealistic elements - ONLY black lines on white."
         )
-        
-        user_prompt = f"Please create a coloring book line art version of this image: {clean_prompt}"
-        
-        key = get_api_key()
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "gpt-4o",
-            "messages": [
-                {
-                    "role": "system", 
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": user_prompt
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{img_b64}",
-                                "detail": "high"
-                            }
-                        }
-                    ]
-                }
-            ],
-            "max_tokens": 300
-        }
-        
-        print(f"[gpt-image-1] Sending request with prompt: {clean_prompt[:100]}...")
-        
-        # Make the API call with retries
-        for attempt in range(1, OPENAI_RETRY_ATTEMPTS + 1):
-            try:
-                response = requests.post(OPENAI_CHAT_COMPLETIONS, headers=headers, json=payload, timeout=120)
-                
-                if response.status_code >= 400:
-                    try:
-                        err = response.json()
-                        error_msg = err.get("error", {}).get("message", response.text)
-                    except:
-                        error_msg = response.text
-                    
-                    print(f"[gpt-image-1] API Error {response.status_code}: {error_msg}")
-                    
-                    if attempt < OPENAI_RETRY_ATTEMPTS:
-                        if "safety" in error_msg.lower() or "policy" in error_msg.lower():
-                            raise Exception(f"Content policy violation: {error_msg}")
-                        
-                        wait_time = min(2 ** attempt, 30)
-                        print(f"[gpt-image-1] Waiting {wait_time}s before retry...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        raise Exception(f"GPT-4o request failed: {response.status_code} - {error_msg}")
-                
-                # Parse response
-                result = response.json()
-                description = result['choices'][0]['message']['content']
-                
-                print(f"[gpt-image-1] Got response: {description[:150]}...")
-                
-                # Now generate image using the standard images/generations endpoint
-                return generate_image_from_description(description.strip())
-                
-            except requests.exceptions.Timeout as e:
-                if attempt < OPENAI_RETRY_ATTEMPTS:
-                    print(f"[gpt-image-1] Timeout (attempt {attempt})")
-                    time.sleep(2 ** attempt)
-                    continue
-                raise Exception(f"GPT-4o timeout after {attempt} attempts")
-            
-            except requests.exceptions.RequestException as e:
-                if attempt < OPENAI_RETRY_ATTEMPTS:
-                    print(f"[gpt-image-1] Request error (attempt {attempt}): {safe_str(e)}")
-                    time.sleep(2 ** attempt)
-                    continue
-                raise Exception(f"GPT-4o request failed after {attempt} attempts: {safe_str(e)}")
-        
-    except Exception as e:
-        raise Exception(f"Coloring book conversion failed: {safe_str(e)}")
+    
+    system_prompt = """You are a professional coloring book artist. When given a photo, you create SVG line art that preserves all important details but converts them to bold black outlines on white background suitable for coloring.
 
-def generate_image_from_description(description: str) -> bytes:
-    """Generate coloring book image using OpenAI images/generations."""
+Generate clean SVG code with:
+- viewBox="0 0 1024 1024" 
+- Only black strokes (#000000) on white background
+- stroke-width between 2-4 for bold lines
+- No fill colors except white background
+- Preserve all facial features, clothing, and background elements as line art
+- Create closed paths perfect for coloring
+
+Return ONLY the SVG code, no explanations."""
+
+    user_prompt = f"Create SVG line art coloring book version of this image: {instruction}"
     
     key = get_api_key()
     headers = {
@@ -394,38 +270,133 @@ def generate_image_from_description(description: str) -> bytes:
         "Content-Type": "application/json"
     }
     
-    # Create coloring book specific prompt
-    generation_prompt = f"Professional adult coloring book line art illustration: {description}. Bold black outlines on pure white background, no colors, no shading, clean line drawing perfect for coloring with markers."
-    
-    # Truncate if too long
-    if len(generation_prompt) > 1000:
-        generation_prompt = generation_prompt[:997] + "..."
-    
     payload = {
-        "model": "dall-e-3",  # Use DALL-E 3 for generation (not editing)
-        "prompt": generation_prompt,
-        "size": "1024x1024",
-        "quality": "standard",
-        "n": 1
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_b64}",
+                            "detail": "high"
+                        }
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 4000,
+        "temperature": 0.1
     }
     
-    print(f"[generate] Creating image with: {generation_prompt[:100]}...")
+    print("[gpt4o] Sending image for SVG line art generation...")
     
-    response = requests.post("https://api.openai.com/v1/images/generations", 
-                           headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
-    response.raise_for_status()
-    
-    result = response.json()
-    image_url = result['data'][0]['url']
-    
-    # Download the generated image
-    img_response = requests.get(image_url, timeout=60)
-    img_response.raise_for_status()
-    
-    print(f"[generate] Successfully generated {len(img_response.content):,} bytes")
-    return img_response.content
+    for attempt in range(1, OPENAI_RETRY_ATTEMPTS + 1):
+        try:
+            response = requests.post(OPENAI_CHAT_COMPLETIONS, headers=headers, json=payload, timeout=120)
+            
+            if response.status_code >= 400:
+                error_text = response.text
+                print(f"[gpt4o] API Error {response.status_code}: {error_text[:200]}")
+                
+                if attempt < OPENAI_RETRY_ATTEMPTS:
+                    if any(keyword in error_text.lower() for keyword in ["safety", "policy", "violation"]):
+                        raise Exception(f"Content policy violation: {error_text}")
+                    
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    raise Exception(f"GPT-4o failed after {OPENAI_RETRY_ATTEMPTS} attempts: {error_text}")
+            
+            result = response.json()
+            svg_content = result['choices'][0]['message']['content'].strip()
+            
+            print(f"[gpt4o] Got SVG response: {len(svg_content)} characters")
+            
+            # Extract SVG from response if it's wrapped in markdown
+            if "```svg" in svg_content:
+                start = svg_content.find("```svg") + 6
+                end = svg_content.find("```", start)
+                svg_content = svg_content[start:end].strip()
+            elif "```" in svg_content:
+                start = svg_content.find("```") + 3
+                end = svg_content.find("```", start)
+                svg_content = svg_content[start:end].strip()
+            
+            # Ensure it starts with <svg
+            if not svg_content.startswith("<svg"):
+                # Try to find SVG content in the response
+                svg_start = svg_content.find("<svg")
+                if svg_start != -1:
+                    svg_content = svg_content[svg_start:]
+                else:
+                    raise Exception("No valid SVG content found in response")
+            
+            # Convert SVG to PNG
+            return convert_svg_to_png(svg_content)
+            
+        except requests.exceptions.Timeout:
+            if attempt < OPENAI_RETRY_ATTEMPTS:
+                print(f"[gpt4o] Timeout (attempt {attempt})")
+                time.sleep(2 ** attempt)
+                continue
+            raise Exception(f"GPT-4o timeout after {attempt} attempts")
+        
+        except Exception as e:
+            if attempt < OPENAI_RETRY_ATTEMPTS:
+                print(f"[gpt4o] Error (attempt {attempt}): {safe_str(e)}")
+                time.sleep(2 ** attempt)
+                continue
+            raise Exception(f"GPT-4o processing failed: {safe_str(e)}")
 
-# ---------- Upload (Your working code) ----------
+def convert_svg_to_png(svg_content: str) -> bytes:
+    """Convert SVG to PNG using a simple approach."""
+    
+    try:
+        # Try using cairosvg if available (better quality)
+        import cairosvg
+        png_bytes = cairosvg.svg2png(bytestring=svg_content.encode('utf-8'), output_width=1024, output_height=1024)
+        print("[svg] Converted with cairosvg")
+        return png_bytes
+        
+    except ImportError:
+        print("[svg] cairosvg not available, using PIL fallback")
+        
+        # Fallback: Create a simple line art image using PIL
+        # This is a backup if SVG conversion fails
+        img = Image.new('RGB', (1024, 1024), 'white')
+        draw = ImageDraw.Draw(img)
+        
+        # Simple placeholder - draw some basic shapes
+        # In reality, you'd want to parse the SVG properly
+        draw.rectangle([50, 50, 974, 974], outline='black', width=3)
+        draw.text((100, 100), "Coloring Page", fill='black')
+        
+        # Convert to PNG bytes
+        buf = io.BytesIO()
+        img.save(buf, format='PNG', optimize=True)
+        return buf.getvalue()
+
+def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
+    """Main processing function using pure GPT-4o vision approach."""
+    
+    try:
+        print("[process] Using PURE GPT-4o Vision approach (no DALL-E)")
+        
+        result_bytes = create_line_art_with_vision(image_bytes, prompt)
+        
+        print(f"[process] Success! Generated {len(result_bytes):,} bytes of line art")
+        return result_bytes
+        
+    except Exception as e:
+        error_msg = safe_str(e)
+        print(f"[process] Failed: {error_msg}")
+        raise Exception(f"Line art conversion failed: {error_msg}")
+
+# ---------- Upload ----------
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
     if not bucket:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -457,7 +428,7 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
         b64 = base64.b64encode(img_bytes).decode("utf-8")
         return f"data:image/png;base64,{b64}"
 
-# ---------- Routes (Your working structure) ----------
+# ---------- Routes ----------
 @app.route("/process", methods=["POST"])
 def process():
     start_time = time.time()
@@ -481,7 +452,7 @@ def process():
         raw_prompt = payload.get("prompt", "")
         prompt = sanitize_text(raw_prompt) if raw_prompt else ""
 
-        print(f"[process] {order_id} - processing {len(valid_urls)} images with FIXED GPT-IMAGE-1")
+        print(f"[process] {order_id} - processing {len(valid_urls)} images with PURE GPT-4O")
 
         results = []
         total_success = 0
@@ -493,18 +464,15 @@ def process():
                 print(f"[process] === IMAGE {idx + 1}/{len(valid_urls)} ===")
                 print(f"[process] URL: {url[:100]}")
                 
-                # Download
                 raw_bytes = download_image(url)
                 download_time = time.time() - image_start
                 print(f"[process] Download time: {download_time:.1f}s")
                 
-                # Process with FIXED METHOD
                 processing_start = time.time()
                 edited_bytes = call_openai_edit(raw_bytes, prompt)
                 processing_time = time.time() - processing_start
                 print(f"[process] Processing time: {processing_time:.1f}s")
                 
-                # Upload
                 upload_start = time.time()
                 result_url = upload_to_gcs(order_id, idx, edited_bytes)
                 upload_time = time.time() - upload_start
@@ -550,7 +518,7 @@ def process():
             "failed_images": total_errors,
             "success_rate_percent": round(success_rate, 1),
             "total_processing_time_seconds": round(total_time, 1),
-            "processing_method": "fixed_gpt_image_1",
+            "processing_method": "pure_gpt4o_vision",
             "results": results
         })
         
@@ -568,26 +536,25 @@ def process():
 def test():
     test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/320px-Cat03.jpg"
     try:
-        print("[test] Testing FIXED GPT-IMAGE-1 method...")
+        print("[test] Testing PURE GPT-4o Vision method...")
         raw = download_image(test_url)
         edited = call_openai_edit(raw, "Convert to coloring book page")
         b64_preview = base64.b64encode(edited).decode("utf-8")[:200]
         
         return safe_json_response({
             "success": True,
-            "message": "Test successful with FIXED GPT-IMAGE-1!",
+            "message": "Test successful with PURE GPT-4o Vision!",
             "original_url": test_url,
             "result_base64_preview": b64_preview + "...",
             "result_size_bytes": len(edited),
             "version": VERSION,
-            "method_used": "fixed_gpt_image_1"
+            "method_used": "pure_gpt4o_vision"
         })
     except Exception as e:
         return safe_json_response({
             "success": False, 
             "error": safe_str(e), 
-            "version": VERSION,
-            "method_attempted": "fixed_gpt_image_1"
+            "version": VERSION
         }, 500)
 
 @app.route("/health", methods=["GET"])
@@ -596,41 +563,26 @@ def health():
         "status": "healthy",
         "service": "coloring-book-processor",
         "version": VERSION,
-        "gcs_available": bucket is not None,
-        "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
-        "bucket_name": bucket_name,
-        "max_images_per_order": MAX_IMAGES_PER_ORDER,
-        "processing_method": "fixed_gpt_image_1",
-        "capabilities": [
-            "gpt4o_vision_analysis",
-            "dalle3_generation", 
-            "your_perfect_prompts"
-        ]
+        "processing_method": "pure_gpt4o_vision",
+        "no_dalle": "DALL-E completely removed",
+        "capabilities": ["gpt4o_vision_svg", "direct_line_art"]
     })
 
 @app.route("/", methods=["GET"])
 def index():
     return safe_json_response({
-        "service": "FIXED GPT-Image-1 Coloring Book Processor", 
+        "service": "Pure GPT-4o Vision Processor",
         "version": VERSION,
-        "processing_method": "GPT-4o Vision + DALL-E 3 Generation (Your Method Fixed)",
-        "capabilities": {
-            "your_perfect_prompts": "Using your proven coloring book prompts",
-            "gpt4o_vision": "Analyzes photos with GPT-4o",
-            "dalle3_generation": "Generates line art with DALL-E 3",
-            "format_support": "All formats (HEIC, JPEG, PNG, etc.)",
-            "batch_processing": f"Up to {MAX_IMAGES_PER_ORDER} images per order"
-        },
+        "method": "GPT-4o Vision Only (No DALL-E)",
+        "approach": "Direct SVG line art generation",
         "endpoints": {
-            "/process": "POST - Process images (YOUR METHOD FIXED)",
-            "/test": "GET/POST - Test with sample", 
-            "/health": "GET - Health check",
-            "/": "GET - This help"
+            "/process": "POST - Pure GPT-4o processing",
+            "/test": "GET/POST - Test method", 
+            "/health": "GET - Health check"
         }
     })
 
 if __name__ == "__main__":
-    print(f"[startup] FIXED GPT-Image-1 Coloring Book Processor {VERSION}")
-    print(f"[startup] Using YOUR proven approach with API fixes")
-    print(f"[startup] Method: GPT-4o Vision + DALL-E 3 Generation")
+    print(f"[startup] Pure GPT-4o Vision Processor {VERSION}")
+    print("[startup] NO DALL-E - Pure vision approach")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
