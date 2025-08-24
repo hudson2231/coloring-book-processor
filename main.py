@@ -63,8 +63,16 @@ def get_api_key() -> str:
 # ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
 DEFAULT_PROMPT = (
-    "Convert this photo into a professional adult coloring book page with clean continuous "
-    "black outlines only on a pure white background"
+    "Transform this photograph into a professional adult coloring book illustration with these MANDATORY requirements: "
+    "PRESERVE EVERY VISIBLE ELEMENT - people, faces, hair, clothing, jewelry, furniture, walls, ceiling, floors, windows, doors, signs, decorations, food, drinks, plants, vehicles, and ALL background objects. "
+    "CONVERT photographic shadows, lighting, and dark areas into clear structural LINE ART ELEMENTS - NOT empty white space. "
+    "CREATE bold consistent black outlines (3-4 pixel width) throughout the ENTIRE image on pure white background. "
+    "MAINTAIN exact facial expressions, eye shapes, smiles, and proportions with precise detail. "
+    "RENDER background architecture as detailed line drawings - include ceiling details, wall textures, window frames, architectural elements. "
+    "TRANSFORM all people in background into clear line art figures - do not eliminate them. "
+    "CONVERT all objects, furniture, and environmental elements into detailed colorable line art sections. "
+    "ENSURE every area has clear, closed outlines perfect for coloring with markers. "
+    "GENERATE publication-quality adult coloring book page with maximum environmental context and rich detail throughout entire scene."
 )
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 REQUEST_TIMEOUT = 30
