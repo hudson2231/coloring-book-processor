@@ -187,37 +187,56 @@ def _rest_image_edit(image_png: bytes, prompt: str) -> bytes:
     return _decode_image_json(resp.json())
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-    # HEIC support with better error handling
+    """Convert image to line art using OpenAI, with robust HEIC support"""
     img = None
     
-    # Try HEIC libraries first
-    try:
-        from pillow_heif import register_heif_opener
-        register_heif_opener()
-        img = Image.open(io.BytesIO(image_bytes))
-        print("[heic] Opened with pillow-heif")
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"[heic] pillow-heif failed: {safe_str(e)}")
+    # Enhanced HEIC detection - check multiple signatures
+    is_heic = (
+        image_bytes[4:12] == b'ftypheic' or 
+        image_bytes[4:12] == b'ftypheif' or
+        image_bytes[4:12] == b'ftypmif1' or  # HEIF variant
+        b'heic' in image_bytes[:32].lower() or
+        b'heif' in image_bytes[:32].lower()
+    )
     
+    print(f"[image] Processing image, size: {len(image_bytes)} bytes, HEIC detected: {is_heic}")
+    
+    # Try to open the image with HEIC support first
+    if is_heic:
+        print("[heic] HEIC/HEIF file detected, processing...")
+        try:
+            # Import and register HEIF support
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+            
+            # Open the HEIC file
+            img = Image.open(io.BytesIO(image_bytes))
+            print(f"[heic] Successfully opened HEIC file: {img.size[0]}x{img.size[1]} pixels, mode: {img.mode}")
+            
+        except ImportError as e:
+            print(f"[heic] pillow-heif not available: {safe_str(e)}")
+            raise ValueError(
+                "HEIC files require special processing libraries that are not available. "
+                "Please convert your HEIC image to JPG format and try again."
+            )
+        except Exception as e:
+            print(f"[heic] Failed to process HEIC file: {safe_str(e)}")
+            raise ValueError(f"Unable to process HEIC file: {safe_str(e)}")
+    
+    # If not HEIC or HEIC processing failed, try standard PIL
     if not img:
         try:
-            import pyheif
-            heif_file = pyheif.read(image_bytes)
-            img = Image.frombytes(heif_file.mode, heif_file.size, heif_file.data, "raw", heif_file.mode, heif_file.stride)
-            print("[heic] Opened with pyheif")
-        except ImportError:
-            pass
+            img = Image.open(io.BytesIO(image_bytes))
+            print(f"[image] Opened standard format: {img.format if hasattr(img, 'format') else 'Unknown'} ({img.size[0]}x{img.size[1]})")
         except Exception as e:
-            print(f"[heic] pyheif failed: {safe_str(e)}")
+            print(f"[image] Failed to open image with PIL: {safe_str(e)}")
+            raise ValueError(f"Unable to process image file: {safe_str(e)}")
     
-    # Fallback to your original logic
+    # Ensure we have a valid image
     if not img:
-        img = Image.open(io.BytesIO(image_bytes))
-        print("[heic] Opened with standard PIL")
+        raise ValueError("Failed to load image - unsupported format or corrupted file")
     
-    # Your exact original logic
+    # Convert to RGB for OpenAI processing (your exact original logic)
     if img.mode == "RGBA":
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[3])
