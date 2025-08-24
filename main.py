@@ -187,22 +187,35 @@ def _rest_image_edit(image_png: bytes, prompt: str) -> bytes:
     return _decode_image_json(resp.json())
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-    # ONLY CHANGE: Try HEIC first, then your original logic
+    # HEIC support with better error handling
+    img = None
+    
+    # Try HEIC libraries first
     try:
         from pillow_heif import register_heif_opener
         register_heif_opener()
         img = Image.open(io.BytesIO(image_bytes))
+        print("[heic] Opened with pillow-heif")
     except ImportError:
+        pass
+    except Exception as e:
+        print(f"[heic] pillow-heif failed: {safe_str(e)}")
+    
+    if not img:
         try:
             import pyheif
             heif_file = pyheif.read(image_bytes)
             img = Image.frombytes(heif_file.mode, heif_file.size, heif_file.data, "raw", heif_file.mode, heif_file.stride)
+            print("[heic] Opened with pyheif")
         except ImportError:
-            # Your original logic
-            img = Image.open(io.BytesIO(image_bytes))
-    except:
-        # Your original logic fallback
+            pass
+        except Exception as e:
+            print(f"[heic] pyheif failed: {safe_str(e)}")
+    
+    # Fallback to your original logic
+    if not img:
         img = Image.open(io.BytesIO(image_bytes))
+        print("[heic] Opened with standard PIL")
     
     # Your exact original logic
     if img.mode == "RGBA":
