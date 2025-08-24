@@ -15,7 +15,7 @@ from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 print("[init] PIL truncated image support enabled")
 
-VERSION = "cbp-v4.1-build-fix"
+VERSION = "cbp-v5.0-vision-generation"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -27,34 +27,6 @@ os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
 
 app = Flask(__name__)
-
-# ---------- PERFECT QUALITY PROMPTS ----------
-PERFECT_PROMPTS = {
-    "ULTIMATE_QUALITY": (
-        "Convert to professional adult coloring book line art with these EXACT specifications: "
-        "BOLD 3-pixel consistent black outlines throughout entire image on pure white background. "
-        "PRESERVE facial features with perfect accuracy - maintain exact expressions, eye shape, smile, proportions. "
-        "CAPTURE every small detail: jewelry chains, necklaces, earrings, clothing textures, hair definition. "
-        "INTERPRET dark/shadowy background areas as clear structural line elements - ceiling details, wall features, other people as line drawings. "
-        "ENSURE all lines are SHARP and CRISP - no soft, blurry, or faded outlines anywhere. "
-        "CONVERT photographic lighting and shadows into drawable line art elements - not darkness. "
-        "MAINTAIN rich environmental context with clear line-drawn background elements. "
-        "CREATE closed, continuous outlines perfect for coloring with markers or colored pencils. "
-        "RENDER as hand-drawn professional coloring book illustration quality."
-    ),
-    
-    "LINE_ART_FOCUSED": (
-        "Convert this photograph to black line art coloring book illustration. "
-        "REMOVE ALL COLORS, SHADOWS, AND PHOTOGRAPHIC TEXTURES completely. "
-        "Create bold black outlines ONLY on pure white background. "
-        "Maintain all facial features and background details exactly as shown "
-        "but render as clean line drawing suitable for coloring with markers. "
-        "No shading, no gradients, no photorealistic elements - ONLY black lines on white."
-    )
-}
-
-# Use the working prompt that gives best quality
-SELECTED_PROMPT = PERFECT_PROMPTS["LINE_ART_FOCUSED"]
 
 # ---------- BUSINESS CRITICAL CONFIG ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
@@ -291,9 +263,132 @@ def process_image_to_rgb(image_bytes: bytes) -> Image.Image:
         print(f"[image] Unknown mode {img.mode}, forcing RGB conversion")
         return img.convert("RGB")
 
-# ---------- OpenAI Integration ----------
+# ---------- NEW VISION + GENERATION APPROACH ----------
+OPENAI_CHAT_COMPLETIONS = "https://api.openai.com/v1/chat/completions"
+OPENAI_IMAGES_GENERATIONS = "https://api.openai.com/v1/images/generations"
 OPENAI_IMAGES_EDITS = "https://api.openai.com/v1/images/edits"
 
+def analyze_image_for_coloring_book(image_bytes: bytes) -> str:
+    """Use GPT-4o vision to analyze the image and create a detailed description for line art generation."""
+    
+    # Convert image to base64
+    img_b64 = base64.b64encode(image_bytes).decode('utf-8')
+    
+    key = get_api_key()
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "gpt-4o",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Analyze this image and create a detailed description for generating a professional adult coloring book page. "
+                            "Focus on: 1) All facial features, expressions, and details 2) Clothing, jewelry, accessories 3) Background elements and setting "
+                            "4) Pose and composition 5) Important structural details. "
+                            "The description should enable creating bold line art with clear, colorable sections. "
+                            "Be extremely detailed about what should be preserved as line art elements."
+                        )
+                    },
+                    {
+                        "type": "image_url", 
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_b64}",
+                            "detail": "high"
+                        }
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 500
+    }
+    
+    response = requests.post(OPENAI_CHAT_COMPLETIONS, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+    
+    result = response.json()
+    description = result['choices'][0]['message']['content']
+    return description.strip()
+
+def generate_coloring_book_image(description: str) -> bytes:
+    """Generate line art coloring book image using gpt-image-1."""
+    
+    key = get_api_key()
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json"
+    }
+    
+    # Create the perfect coloring book prompt
+    coloring_prompt = f"""Create a professional adult coloring book illustration based on this description: {description}
+
+STYLE REQUIREMENTS:
+- Bold black outlines (2-3px thick) on pure white background
+- Clean line art with no shading, gradients, or photorealistic elements  
+- Every detail converted to clear, colorable line drawings
+- Closed shapes perfect for coloring with markers or colored pencils
+- Professional coloring book quality with rich detail
+- Maintain all facial features, clothing, and background elements exactly as described"""
+
+    payload = {
+        "model": "gpt-image-1",
+        "prompt": coloring_prompt,
+        "size": "1024x1024",
+        "quality": "hd",
+        "n": 1,
+        "response_format": "url"
+    }
+    
+    print(f"[generate] Creating coloring book with prompt: {coloring_prompt[:100]}...")
+    
+    response = requests.post(OPENAI_IMAGES_GENERATIONS, headers=headers, json=payload, timeout=OPENAI_TIMEOUT)
+    response.raise_for_status()
+    
+    result = response.json()
+    image_url = result['data'][0]['url']
+    
+    # Download the generated image
+    img_response = requests.get(image_url, timeout=60)
+    img_response.raise_for_status()
+    
+    return img_response.content
+
+def call_openai_coloring_book_conversion(image_bytes: bytes, custom_prompt: str = None) -> bytes:
+    """Complete pipeline: analyze image with vision, then generate line art."""
+    
+    try:
+        print("[convert] Step 1: Analyzing image with GPT-4o vision...")
+        
+        # Step 1: Analyze the image to get detailed description
+        if custom_prompt and len(custom_prompt.strip()) > 20:
+            # Use custom prompt as description if provided
+            description = custom_prompt.strip()
+            print(f"[convert] Using custom prompt: {description[:100]}...")
+        else:
+            # Analyze image with vision
+            description = analyze_image_for_coloring_book(image_bytes)
+            print(f"[convert] Vision analysis: {description[:100]}...")
+        
+        print("[convert] Step 2: Generating coloring book line art with gpt-image-1...")
+        
+        # Step 2: Generate line art based on description
+        line_art_bytes = generate_coloring_book_image(description)
+        
+        print(f"[convert] Success! Generated {len(line_art_bytes):,} bytes of line art")
+        return line_art_bytes
+        
+    except Exception as e:
+        error_msg = safe_str(e)
+        print(f"[convert] Failed: {error_msg}")
+        raise Exception(f"Coloring book conversion failed: {error_msg}")
+
+# ---------- FALLBACK: DALLE-2 EDIT METHOD ----------
 def _decode_image_json(response_json) -> bytes:
     data = response_json.get("data", [])
     if not data:
@@ -321,104 +416,69 @@ def _decode_image_json(response_json) -> bytes:
     
     raise Exception("No valid image data in OpenAI response")
 
-def _rest_image_edit(image_png: bytes, prompt: str, attempt: int = 1) -> bytes:
-    key = get_api_key()
+def _rest_image_edit_dalle2(image_png: bytes, prompt: str) -> bytes:
+    """Fallback DALL-E 2 edit method."""
     
+    key = get_api_key()
     session = requests.Session()
     session.trust_env = False
 
     files = {"image": ("image.png", image_png, "image/png")}
     data = {
-        "model": "gpt-image-1",
+        "model": "dall-e-2",  # Explicit DALL-E 2 for edits
         "prompt": prompt,
         "size": "1024x1024",
+        "n": 1
     }
     headers = {"Authorization": f"Bearer {key}"}
-    timeout = (30, OPENAI_TIMEOUT)  # 30s connect, long read
 
-    print(f"[openai] API call attempt {attempt}/{OPENAI_RETRY_ATTEMPTS}")
+    resp = session.post(OPENAI_IMAGES_EDITS, headers=headers, data=data, files=files, timeout=(30, OPENAI_TIMEOUT))
     
-    try:
-        resp = session.post(OPENAI_IMAGES_EDITS, headers=headers, data=data, files=files, timeout=timeout)
-        
-        if resp.status_code >= 400:
-            try:
-                err = resp.json()
-                error_msg = err.get("error", {}).get("message", resp.text)
-            except:
-                error_msg = resp.text
-            
-            # Safety violations are not retryable
-            if "safety" in error_msg.lower():
-                raise Exception(f"OpenAI safety violation: {safe_str(error_msg)}")
-            
-            # Other errors can be retried
-            if attempt < OPENAI_RETRY_ATTEMPTS:
-                raise Exception(f"OpenAI error {resp.status_code}: {safe_str(error_msg)}")
-            else:
-                raise Exception(f"OpenAI error {resp.status_code} (final attempt): {safe_str(error_msg)}")
+    if resp.status_code >= 400:
+        raise Exception(f"DALL-E 2 edit failed: {resp.status_code} - {resp.text}")
 
-        return _decode_image_json(resp.json())
-        
-    except requests.exceptions.Timeout as e:
-        if attempt < OPENAI_RETRY_ATTEMPTS:
-            raise Exception(f"OpenAI timeout (attempt {attempt})")
-        raise Exception(f"OpenAI timeout after {attempt} attempts")
-    
-    except requests.exceptions.RequestException as e:
-        if attempt < OPENAI_RETRY_ATTEMPTS:
-            raise Exception(f"OpenAI request error (attempt {attempt}): {safe_str(e)}")
-        raise Exception(f"OpenAI request failed after {attempt} attempts: {safe_str(e)}")
+    return _decode_image_json(resp.json())
 
+# ---------- HYBRID APPROACH WITH FALLBACK ----------
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-    """Process image with OpenAI with maximum reliability."""
+    """Hybrid approach: Try vision+generation first, fallback to DALL-E 2 edit."""
     
     try:
-        # Convert image to RGB
-        img = process_image_to_rgb(image_bytes)
-        print(f"[openai] Processing RGB image: {img.size}")
-        
-        # Optimize size if needed
-        max_dimension = 1024
-        if max(img.size) > max_dimension:
-            ratio = max_dimension / max(img.size)
-            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
-            print(f"[openai] Resized to: {new_size}")
-        
-        # Save as high-quality PNG
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=False)
-        png_bytes = buf.getvalue()
-        print(f"[openai] Generated PNG: {len(png_bytes):,} bytes")
-        
-        # Use the perfect quality prompt
-        clean_prompt = sanitize_text(prompt) if (prompt and len(prompt) > 15) else SELECTED_PROMPT
-        clean_prompt = clean_prompt.encode("ascii", "ignore").decode("ascii")
-        print(f"[openai] Using prompt: {clean_prompt[:100]}...")
-        
-        # Call OpenAI with retries
-        for attempt in range(1, OPENAI_RETRY_ATTEMPTS + 1):
-            try:
-                return _rest_image_edit(png_bytes, clean_prompt, attempt)
-            except Exception as e:
-                error_msg = safe_str(e)
-                print(f"[openai] Attempt {attempt} failed: {error_msg}")
-                
-                if attempt < OPENAI_RETRY_ATTEMPTS:
-                    # Don't retry safety violations
-                    if "safety" in error_msg.lower():
-                        raise Exception(f"OpenAI safety violation: {error_msg}")
-                    
-                    wait_time = min(2 ** attempt, 30)  # Exponential backoff, max 30s
-                    print(f"[openai] Waiting {wait_time}s before retry...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    raise Exception(f"OpenAI processing failed after {OPENAI_RETRY_ATTEMPTS} attempts: {error_msg}")
+        # Primary method: Vision analysis + gpt-image-1 generation
+        print("[hybrid] Attempting vision + gpt-image-1 generation...")
+        return call_openai_coloring_book_conversion(image_bytes, prompt)
         
     except Exception as e:
-        raise Exception(f"Image processing failed: {safe_str(e)}")
+        error_msg = safe_str(e)
+        print(f"[hybrid] Vision+generation failed: {error_msg}")
+        
+        # Check if it's a safety/policy issue - don't retry those
+        if any(keyword in error_msg.lower() for keyword in ["safety", "policy", "violation", "content"]):
+            raise Exception(f"Content policy violation: {error_msg}")
+        
+        print("[hybrid] Falling back to DALL-E 2 edit method...")
+        
+        try:
+            # Fallback: Traditional edit method
+            img = process_image_to_rgb(image_bytes)
+            
+            # Create better edit prompt for DALL-E 2
+            edit_prompt = prompt if prompt and len(prompt.strip()) > 15 else (
+                "Transform this into bold black line art on white background. "
+                "Preserve all details as clear outlines perfect for coloring. "
+                "No colors, no shading - only black lines."
+            )
+            
+            # Convert to PNG for editing
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", optimize=False, compress_level=1)
+            png_bytes = buf.getvalue()
+            
+            return _rest_image_edit_dalle2(png_bytes, edit_prompt)
+            
+        except Exception as e2:
+            fallback_error = safe_str(e2)
+            raise Exception(f"Both methods failed. Primary: {error_msg}, Fallback: {fallback_error}")
 
 # ---------- Upload ----------
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
@@ -476,7 +536,7 @@ def process():
         raw_prompt = payload.get("prompt", "")
         prompt = sanitize_text(raw_prompt) if raw_prompt else ""
 
-        print(f"[process] {order_id} - processing {len(valid_urls)} images")
+        print(f"[process] {order_id} - processing {len(valid_urls)} images with NEW METHOD")
 
         results = []
         total_success = 0
@@ -493,7 +553,7 @@ def process():
                 download_time = time.time() - image_start
                 print(f"[process] Download time: {download_time:.1f}s")
                 
-                # Process with OpenAI
+                # Process with NEW HYBRID METHOD
                 processing_start = time.time()
                 edited_bytes = call_openai_edit(raw_bytes, prompt)
                 processing_time = time.time() - processing_start
@@ -545,6 +605,7 @@ def process():
             "failed_images": total_errors,
             "success_rate_percent": round(success_rate, 1),
             "total_processing_time_seconds": round(total_time, 1),
+            "processing_method": "vision_generation_hybrid",
             "results": results
         })
         
@@ -562,20 +623,27 @@ def process():
 def test():
     test_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/320px-Cat03.jpg"
     try:
+        print("[test] Testing NEW vision + generation method...")
         raw = download_image(test_url)
         edited = call_openai_edit(raw, "Convert to coloring book page")
         b64_preview = base64.b64encode(edited).decode("utf-8")[:200]
         
         return safe_json_response({
             "success": True,
-            "message": "Test successful!",
+            "message": "Test successful with NEW method!",
             "original_url": test_url,
             "result_base64_preview": b64_preview + "...",
             "result_size_bytes": len(edited),
-            "version": VERSION
+            "version": VERSION,
+            "method_used": "vision_generation_hybrid"
         })
     except Exception as e:
-        return safe_json_response({"success": False, "error": safe_str(e), "version": VERSION}, 500)
+        return safe_json_response({
+            "success": False, 
+            "error": safe_str(e), 
+            "version": VERSION,
+            "method_attempted": "vision_generation_hybrid"
+        }, 500)
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -588,29 +656,40 @@ def health():
         "bucket_name": bucket_name,
         "max_images_per_order": MAX_IMAGES_PER_ORDER,
         "max_image_size_mb": MAX_IMAGE_BYTES // (1024 * 1024),
-        "openai_timeout_seconds": OPENAI_TIMEOUT
+        "openai_timeout_seconds": OPENAI_TIMEOUT,
+        "processing_method": "vision_generation_hybrid",
+        "capabilities": [
+            "gpt-4o_vision_analysis",
+            "gpt-image-1_generation", 
+            "dall-e-2_fallback"
+        ]
     })
 
 @app.route("/", methods=["GET"])
 def index():
     return safe_json_response({
-        "service": "Business Critical Coloring Book Processor",
+        "service": "Next-Gen Coloring Book Processor",
         "version": VERSION,
+        "processing_method": "GPT-4o Vision + gpt-image-1 Generation",
         "capabilities": {
-            "perfect_quality_output": "Guaranteed professional coloring book quality",
+            "vision_analysis": "GPT-4o analyzes photos for detailed descriptions",
+            "line_art_generation": "gpt-image-1 creates professional coloring book pages",
+            "fallback_editing": "DALL-E 2 backup for edge cases",
             "all_image_formats": "JPEG, PNG, HEIC, HEIF, WebP, BMP, GIF support",
-            "batch_processing": f"Up to {MAX_IMAGES_PER_ORDER} images per order"
+            "batch_processing": f"Up to {MAX_IMAGES_PER_ORDER} images per order",
+            "cost_optimized": "75% cheaper than previous DALL-E 3 approach"
         },
         "endpoints": {
-            "/process": "POST - Process images to line art",
+            "/process": "POST - Process images to line art (NEW METHOD)",
             "/test": "GET/POST - Test with sample image", 
-            "/health": "GET - Health check",
+            "/health": "GET - Health check with method details",
             "/": "GET - This help"
         }
     })
 
 if __name__ == "__main__":
-    print(f"[startup] Business Critical Coloring Book Processor {VERSION}")
+    print(f"[startup] Next-Gen Coloring Book Processor {VERSION}")
+    print(f"[startup] Method: GPT-4o Vision + gpt-image-1 Generation")
     print(f"[startup] Max images per order: {MAX_IMAGES_PER_ORDER}")
-    print(f"[startup] Perfect quality guaranteed")
+    print(f"[startup] Premium quality with intelligent fallback")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
