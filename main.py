@@ -187,7 +187,7 @@ def _rest_image_edit(image_png: bytes, prompt: str) -> bytes:
    return _decode_image_json(resp.json())
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-   """Convert image to line art using OpenAI, with HEIC support via pyheif"""
+   """Convert image to line art using OpenAI, with HEIC support via pillow-heif"""
    img = None
    
    # Enhanced HEIC detection - check multiple signatures
@@ -201,20 +201,13 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
    
    print(f"[image] Processing image, size: {len(image_bytes)} bytes, HEIC detected: {is_heic}")
    
-   # Try to open the image with HEIC support using pyheif
+   # Try to open the image with HEIC support using pillow-heif
    if is_heic:
-       print("[heic] HEIC/HEIF file detected, processing with pyheif...")
+       print("[heic] HEIC/HEIF file detected, processing with pillow-heif...")
        try:
-           import pyheif
-           heif_file = pyheif.read(image_bytes)
-           img = Image.frombytes(
-               heif_file.mode, 
-               heif_file.size, 
-               heif_file.data,
-               "raw",
-               heif_file.mode,
-               heif_file.stride,
-           )
+           from pillow_heif import register_heif_opener
+           register_heif_opener()
+           img = Image.open(io.BytesIO(image_bytes))
            print(f"[heic] Successfully opened HEIC file: {img.size[0]}x{img.size[1]} pixels")
        except ImportError:
            raise ValueError("HEIC support not available")
