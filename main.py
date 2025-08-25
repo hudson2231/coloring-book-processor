@@ -285,7 +285,34 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
 @app.route("/process", methods=["POST"])
 def process():
    try:
-       payload = request.get_json(force=True) or {}
+       # Try to get JSON data first
+       payload = request.get_json(force=True, silent=True)
+       
+       # If no JSON, try form data
+       if not payload:
+           payload = {}
+           # Get form data
+           payload['order_id'] = request.form.get('order_id', f"order_{int(time.time())}")
+           
+           # Handle image_urls - might come as single string or multiple values
+           image_urls = request.form.get('image_urls', '')
+           if image_urls:
+               # If it's a JSON string, parse it
+               try:
+                   image_urls = json.loads(image_urls)
+               except:
+                   # Otherwise treat as comma-separated
+                   image_urls = [u.strip() for u in image_urls.split(',') if u.strip()]
+           else:
+               # Check for multiple image_url fields
+               image_urls = request.form.getlist('image_url')
+           
+           payload['image_urls'] = image_urls
+           payload['prompt'] = request.form.get('prompt', DEFAULT_PROMPT)
+           
+           print(f"[process] Using form data: order_id={payload.get('order_id')}, urls={len(payload.get('image_urls', []))}")
+       
+       # Rest of your existing processing code
        order_id = sanitize_text(payload.get("order_id", f"order_{int(time.time())}"))
 
        image_urls = payload.get("image_urls") or payload.get("urls") or []
