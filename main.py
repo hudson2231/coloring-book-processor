@@ -6,12 +6,12 @@ import requests
 from flask import Flask, request, Response
 import json
 from google.cloud import storage
+from google.cloud import tasks_v2
 import re
 from PIL import Image
-import threading
 import uuid
 
-VERSION = "cbp-v1.2-async-sheets"
+VERSION = "cbp-v1.3-cloud-tasks"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -79,7 +79,7 @@ DEFAULT_PROMPT = (
 )
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 REQUEST_TIMEOUT = 30
-OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT", "300"))  # seconds
+OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT", "300"))
 
 # ---------- GCS client ----------
 try:
@@ -95,7 +95,6 @@ except Exception as e:
 def extract_direct_image_url(url: str) -> str:
    url = sanitize_text(url)
    lower = url.lower()
-   # ONLY CHANGE: Added HEIC support
    if lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif")):
        return url
    if "uploadkit" in lower or "download.html" in lower:
@@ -145,7 +144,6 @@ def _decode_image_json(j) -> bytes:
    if "b64_json" in item and item["b64_json"]:
        return base64.b64decode(item["b64_json"])
    if "url" in item and item["url"]:
-       # Fetch the URL with env proxies disabled
        s = requests.Session()
        s.trust_env = False
        with s.get(item["url"], timeout=(10, OPENAI_TIMEOUT)) as r:
@@ -158,71 +156,38 @@ OPENAI_IMAGES_EDITS = "https://api.openai.com/v1/images/edits"
 
 def _rest_image_edit(image_png: bytes, prompt: str) -> bytes:
    key = get_api_key()
+   s = requests.Session()
+   s.trust_env = False
    
-   max_retries = 3
-   for attempt in range(max_retries):
+   files = {"image": ("image.png", image_png, "image/png")}
+   data = {"model": "gpt-image-1", "prompt": prompt, "size": "1024x1024"}
+   headers = {"Authorization": f"Bearer {key}"}
+   
+   print("[openai-http] calling images/edits")
+   resp = s.post(OPENAI_IMAGES_EDITS, headers=headers, data=data, files=files, timeout=(10, OPENAI_TIMEOUT))
+   
+   if resp.status_code >= 400:
        try:
-           # Create fresh session for each attempt
-           s = requests.Session()
-           s.trust_env = False
-           
-           files = {
-               "image": ("image.png", image_png, "image/png"),
-           }
-           data = {
-               "model": "gpt-image-1",
-               "prompt": prompt,
-               "size": "1024x1024",
-           }
-           headers = {
-               "Authorization": f"Bearer {key}",
-           }
-           
-           print(f"[openai-http] calling images/edits (attempt {attempt + 1}/{max_retries})")
-           
-           # Increased connection timeout to 30 seconds
-           resp = s.post(
-               OPENAI_IMAGES_EDITS, 
-               headers=headers, 
-               data=data, 
-               files=files, 
-               timeout=(30, OPENAI_TIMEOUT)
-           )
-           
-           if resp.status_code >= 400:
-               try:
-                   err = resp.json()
-               except Exception:
-                   err = {"error": {"message": resp.text}}
-               raise Exception(f"OpenAI HTTP {resp.status_code}: {safe_str(err)}")
-           
-           return _decode_image_json(resp.json())
-           
-       except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
-           if attempt < max_retries - 1:
-               wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
-               print(f"[openai-http] SSL/Connection error, retrying in {wait_time}s: {safe_str(e)}")
-               time.sleep(wait_time)
-           else:
-               print(f"[openai-http] Failed after {max_retries} attempts: {safe_str(e)}")
-               raise
+           err = resp.json()
+       except Exception:
+           err = {"error": {"message": resp.text}}
+       raise Exception(f"OpenAI HTTP {resp.status_code}: {safe_str(err)}")
+   
+   return _decode_image_json(resp.json())
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
-   """Convert image to line art using OpenAI, with HEIC support via pillow-heif"""
    img = None
    
-   # Enhanced HEIC detection - check multiple signatures
    is_heic = (
        image_bytes[4:12] == b'ftypheic' or 
        image_bytes[4:12] == b'ftypheif' or
-       image_bytes[4:12] == b'ftypmif1' or  # HEIF variant
+       image_bytes[4:12] == b'ftypmif1' or
        b'heic' in image_bytes[:32].lower() or
        b'heif' in image_bytes[:32].lower()
    )
    
    print(f"[image] Processing image, size: {len(image_bytes)} bytes, HEIC detected: {is_heic}")
    
-   # Try to open the image with HEIC support using pillow-heif
    if is_heic:
        print("[heic] HEIC/HEIF file detected, processing with pillow-heif...")
        try:
@@ -236,7 +201,6 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
            print(f"[heic] Failed to process HEIC file: {safe_str(e)}")
            raise ValueError(f"HEIC processing failed: {safe_str(e)}")
    
-   # If not HEIC or HEIC processing failed, try standard PIL
    if not img:
        try:
            img = Image.open(io.BytesIO(image_bytes))
@@ -245,17 +209,16 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
            print(f"[image] Failed to open image with PIL: {safe_str(e)}")
            raise ValueError(f"Unable to process image file: {safe_str(e)}")
    
-   # Ensure we have a valid image
    if not img:
        raise ValueError("Failed to load image - unsupported format or corrupted file")
    
-   # Convert to RGB for OpenAI processing (your exact original logic)
    if img.mode == "RGBA":
        bg = Image.new("RGB", img.size, (255, 255, 255))
        bg.paste(img, mask=img.split()[3])
        img = bg
    elif img.mode != "RGB":
        img = img.convert("RGB")
+   
    buf = io.BytesIO()
    img.save(buf, format="PNG")
    buf.seek(0)
@@ -283,17 +246,17 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
 
    blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
    blob = bucket.blob(blob_name)
-
    blob.cache_control = "public, max-age=31536000, immutable"
    blob.upload_from_string(img_bytes, content_type="image/png")
+   
    try:
        blob.patch()
    except Exception as e:
        print(f"[gcs] patch failed: {safe_str(e)}")
    try:
-       blob.make_public()  # if PAP/UBLA prevents, URL still works for signed URLs (not used here)
+       blob.make_public()
    except Exception as e:
-       print(f"[gcs] make_public failed (likely uniform access/PAP): {safe_str(e)}")
+       print(f"[gcs] make_public failed: {safe_str(e)}")
 
    url = blob.public_url
    if isinstance(url, bytes):
@@ -302,30 +265,88 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
        url = f"https://storage.googleapis.com/{bucket.name}/{blob_name}"
    return url
 
-# ---------- Background Processing ----------
-def process_in_background(job_id, payload):
+# ---------- Routes ----------
+@app.route("/process", methods=["POST"])
+def process():
+   try:
+       payload = request.get_json(force=True, silent=True)
+       
+       if not payload:
+           payload = {}
+           payload['order_id'] = request.form.get('order_id', f"order_{int(time.time())}")
+           image_urls = request.form.get('image_urls', '')
+           if image_urls:
+               try:
+                   image_urls = json.loads(image_urls)
+               except:
+                   image_urls = [u.strip() for u in image_urls.split(',') if u.strip()]
+           else:
+               image_urls = request.form.getlist('image_url')
+           payload['image_urls'] = image_urls
+           payload['prompt'] = request.form.get('prompt', DEFAULT_PROMPT)
+       
+       print(f"[process] order_id={payload.get('order_id')}, urls={len(payload.get('image_urls', []))}")
+       
+       # Queue to Cloud Tasks
+       try:
+           client = tasks_v2.CloudTasksClient()
+           parent = client.queue_path('coloring-book-processor', 'us-central1', 'image-processing')
+           
+           task = {
+               'http_request': {
+                   'http_method': tasks_v2.HttpMethod.POST,
+                   'url': 'https://coloring-book-processor-585071603431.us-central1.run.app/process-worker',
+                   'headers': {'Content-Type': 'application/json'},
+                   'body': json.dumps(payload).encode()
+               }
+           }
+           
+           client.create_task(request={'parent': parent, 'task': task})
+           print(f"[process] Queued to Cloud Tasks")
+           
+       except Exception as e:
+           print(f"[process] Cloud Tasks not available, processing synchronously: {safe_str(e)}")
+           # Fallback to synchronous processing if Cloud Tasks isn't set up
+           return process_worker_internal(payload)
+       
+       return safe_json_response({
+           "success": True,
+           "status": "queued",
+           "order_id": payload.get("order_id"),
+           "message": f"Processing {len(payload.get('image_urls', []))} images"
+       })
+       
+   except Exception as e:
+       err = safe_str(e)
+       print(f"[process] request failed: {err}")
+       return safe_json_response({"success": False, "error": err}, 500)
+
+@app.route("/process-worker", methods=["POST"])
+def process_worker():
+   payload = request.get_json(force=True)
+   return process_worker_internal(payload)
+
+def process_worker_internal(payload):
    from google.oauth2 import service_account
    from googleapiclient.discovery import build
    
    try:
-       print(f"[background] Starting job {job_id}")
-       
-       # Extract data
        order_id = payload.get("order_id", f"order_{int(time.time())}")
        image_urls = payload.get("image_urls", [])
        prompt = payload.get("prompt", DEFAULT_PROMPT)
        
-       # Process images
+       print(f"[worker] Processing {len(image_urls)} images for order {order_id}")
+       
        results = []
        for idx, url in enumerate(image_urls):
            try:
-               print(f"[background] Processing image {idx+1}/{len(image_urls)}")
+               print(f"[worker] Processing image {idx+1}/{len(image_urls)}")
                raw = download_image(url)
                edited = call_openai_edit(raw, prompt)
                final_url = upload_to_gcs(order_id, idx, edited)
                results.append(final_url)
            except Exception as e:
-               print(f"[background] Error processing image {idx}: {safe_str(e)}")
+               print(f"[worker] Error processing image {idx}: {safe_str(e)}")
                results.append(f"ERROR: {safe_str(e)}")
        
        # Write to Google Sheets
@@ -351,69 +372,16 @@ def process_in_background(job_id, payload):
                ]]}
            ).execute()
            
-           print(f"[background] Job {job_id} complete. {len(results)} images processed, saved to sheets.")
+           print(f"[worker] Order {order_id} complete. {len(results)} images processed, saved to sheets.")
            
        except Exception as e:
-           print(f"[background] Failed to write to sheets: {safe_str(e)}")
+           print(f"[worker] Failed to write to sheets: {safe_str(e)}")
+       
+       return safe_json_response({"success": True, "results": results})
        
    except Exception as e:
-       print(f"[background] Job {job_id} failed: {safe_str(e)}")
-
-# ---------- Routes ----------
-@app.route("/process", methods=["POST"])
-def process():
-   try:
-       # Try to get JSON data first
-       payload = request.get_json(force=True, silent=True)
-       
-       # If no JSON, try form data
-       if not payload:
-           payload = {}
-           # Get form data
-           payload['order_id'] = request.form.get('order_id', f"order_{int(time.time())}")
-           
-           # Handle image_urls - might come as single string or multiple values
-           image_urls = request.form.get('image_urls', '')
-           if image_urls:
-               # If it's a JSON string, parse it
-               try:
-                   image_urls = json.loads(image_urls)
-               except:
-                   # Otherwise treat as comma-separated
-                   image_urls = [u.strip() for u in image_urls.split(',') if u.strip()]
-           else:
-               # Check for multiple image_url fields
-               image_urls = request.form.getlist('image_url')
-           
-           payload['image_urls'] = image_urls
-           payload['prompt'] = request.form.get('prompt', DEFAULT_PROMPT)
-           
-           print(f"[process] Using form data: order_id={payload.get('order_id')}, urls={len(payload.get('image_urls', []))}")
-       
-       # Generate job ID
-       job_id = str(uuid.uuid4())
-       
-       # Start background processing
-       thread = threading.Thread(
-           target=process_in_background,
-           args=(job_id, payload)
-       )
-       thread.daemon = True
-       thread.start()
-       
-       # Return immediately to avoid timeout
-       return safe_json_response({
-           "success": True,
-           "job_id": job_id,
-           "status": "queued",
-           "order_id": payload.get("order_id"),
-           "message": f"Processing {len(payload.get('image_urls', []))} images in background"
-       })
-       
-   except Exception as e:
-       err = safe_str(e)
-       print(f"[process] request failed: {err}")
-       return safe_json_response({"success": False, "error": err}, 500)
+       print(f"[worker] Job failed: {safe_str(e)}")
+       return safe_json_response({"success": False, "error": safe_str(e)}, 500)
 
 @app.route("/test", methods=["GET", "POST"])
 def test():
@@ -449,18 +417,10 @@ def index():
        "service": "Coloring Book Processor",
        "endpoints": {
            "/process": "POST - Process images to line art",
+           "/process-worker": "POST - Worker endpoint for Cloud Tasks",
            "/test": "GET/POST - Test with sample image",
            "/health": "GET - Health check",
            "/": "GET - This help"
-       },
-       "example_request": {
-           "url": "/process",
-           "method": "POST",
-           "body": {
-               "order_id": "order_123",
-               "urls": ["https://example.com/image1.jpg"],
-               "prompt": "Convert to coloring book page"
-           }
        }
    })
 
