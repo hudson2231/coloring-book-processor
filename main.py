@@ -158,35 +158,54 @@ OPENAI_IMAGES_EDITS = "https://api.openai.com/v1/images/edits"
 
 def _rest_image_edit(image_png: bytes, prompt: str) -> bytes:
    key = get_api_key()
-
-   # Disable reading proxy env
-   s = requests.Session()
-   s.trust_env = False  # ignore *_PROXY envs entirely
-
-   files = {
-       "image": ("image.png", image_png, "image/png"),
-   }
-   data = {
-       "model": "gpt-image-1",
-       "prompt": prompt,
-       "size": "1024x1024",
-   }
-   headers = {
-       "Authorization": f"Bearer {key}",
-   }
-   # 2-tuple timeout: (connect, read)
-   tmo = (10, OPENAI_TIMEOUT)
-
-   print("[openai-http] calling images/edits")
-   resp = s.post(OPENAI_IMAGES_EDITS, headers=headers, data=data, files=files, timeout=tmo)
-   if resp.status_code >= 400:
+   
+   max_retries = 3
+   for attempt in range(max_retries):
        try:
-           err = resp.json()
-       except Exception:
-           err = {"error": {"message": resp.text}}
-       raise Exception(f"OpenAI HTTP {resp.status_code}: {safe_str(err)}")
-
-   return _decode_image_json(resp.json())
+           # Create fresh session for each attempt
+           s = requests.Session()
+           s.trust_env = False
+           
+           files = {
+               "image": ("image.png", image_png, "image/png"),
+           }
+           data = {
+               "model": "gpt-image-1",
+               "prompt": prompt,
+               "size": "1024x1024",
+           }
+           headers = {
+               "Authorization": f"Bearer {key}",
+           }
+           
+           print(f"[openai-http] calling images/edits (attempt {attempt + 1}/{max_retries})")
+           
+           # Increased connection timeout to 30 seconds
+           resp = s.post(
+               OPENAI_IMAGES_EDITS, 
+               headers=headers, 
+               data=data, 
+               files=files, 
+               timeout=(30, OPENAI_TIMEOUT)
+           )
+           
+           if resp.status_code >= 400:
+               try:
+                   err = resp.json()
+               except Exception:
+                   err = {"error": {"message": resp.text}}
+               raise Exception(f"OpenAI HTTP {resp.status_code}: {safe_str(err)}")
+           
+           return _decode_image_json(resp.json())
+           
+       except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+           if attempt < max_retries - 1:
+               wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+               print(f"[openai-http] SSL/Connection error, retrying in {wait_time}s: {safe_str(e)}")
+               time.sleep(wait_time)
+           else:
+               print(f"[openai-http] Failed after {max_retries} attempts: {safe_str(e)}")
+               raise
 
 def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
    """Convert image to line art using OpenAI, with HEIC support via pillow-heif"""
