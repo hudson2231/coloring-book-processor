@@ -8,8 +8,10 @@ import json
 from google.cloud import storage
 import re
 from PIL import Image
+import threading
+import uuid
 
-VERSION = "cbp-v1.1-heic-only-fix"
+VERSION = "cbp-v1.2-async-sheets"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -281,6 +283,63 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
        url = f"https://storage.googleapis.com/{bucket.name}/{blob_name}"
    return url
 
+# ---------- Background Processing ----------
+def process_in_background(job_id, payload):
+   from google.oauth2 import service_account
+   from googleapiclient.discovery import build
+   
+   try:
+       print(f"[background] Starting job {job_id}")
+       
+       # Extract data
+       order_id = payload.get("order_id", f"order_{int(time.time())}")
+       image_urls = payload.get("image_urls", [])
+       prompt = payload.get("prompt", DEFAULT_PROMPT)
+       
+       # Process images
+       results = []
+       for idx, url in enumerate(image_urls):
+           try:
+               print(f"[background] Processing image {idx+1}/{len(image_urls)}")
+               raw = download_image(url)
+               edited = call_openai_edit(raw, prompt)
+               final_url = upload_to_gcs(order_id, idx, edited)
+               results.append(final_url)
+           except Exception as e:
+               print(f"[background] Error processing image {idx}: {safe_str(e)}")
+               results.append(f"ERROR: {safe_str(e)}")
+       
+       # Write to Google Sheets
+       try:
+           creds = service_account.Credentials.from_service_account_file('key.json')
+           service = build('sheets', 'v4', credentials=creds)
+           
+           service.spreadsheets().values().append(
+               spreadsheetId='1SQJNA4ztkUT64Pzlv0AxlpG7Rsvq9pqVnkOCGlMTIug',
+               range='A:J',
+               valueInputOption='RAW',
+               body={'values': [[
+                   order_id,
+                   payload.get('customer_name', 'N/A'),
+                   payload.get('customer_email', 'N/A'),
+                   payload.get('shipping_address', 'N/A'),
+                   ','.join([r for r in results if not r.startswith("ERROR")]),
+                   'needs_review',
+                   time.strftime('%Y-%m-%d %H:%M:%S'),
+                   len([r for r in results if not r.startswith("ERROR")]),
+                   payload.get('shopify_order_number', order_id),
+                   'Processed successfully' if all(not r.startswith("ERROR") for r in results) else 'Some images failed'
+               ]]}
+           ).execute()
+           
+           print(f"[background] Job {job_id} complete. {len(results)} images processed, saved to sheets.")
+           
+       except Exception as e:
+           print(f"[background] Failed to write to sheets: {safe_str(e)}")
+       
+   except Exception as e:
+       print(f"[background] Job {job_id} failed: {safe_str(e)}")
+
 # ---------- Routes ----------
 @app.route("/process", methods=["POST"])
 def process():
@@ -312,47 +371,26 @@ def process():
            
            print(f"[process] Using form data: order_id={payload.get('order_id')}, urls={len(payload.get('image_urls', []))}")
        
-       # Rest of your existing processing code
-       order_id = sanitize_text(payload.get("order_id", f"order_{int(time.time())}"))
-
-       image_urls = payload.get("image_urls") or payload.get("urls") or []
-       if isinstance(image_urls, str):
-           image_urls = [u.strip() for u in image_urls.split(",") if u.strip()]
-       image_urls = [sanitize_text(u) for u in image_urls]
-
-       raw_prompt = payload.get("prompt", DEFAULT_PROMPT)
-       prompt = sanitize_text(raw_prompt) if raw_prompt else DEFAULT_PROMPT
-
-       print(f"[process] {order_id} - {len(image_urls)} image(s)")
-
-       results = []
-       for idx, url in enumerate(image_urls):
-           try:
-               raw = download_image(url)
-               print(f"[process] downloaded {len(raw)} bytes")
-               edited = call_openai_edit(raw, prompt)
-               print(f"[process] openai done -> {len(edited)} bytes")
-               final_url = upload_to_gcs(order_id, idx, edited)
-               results.append({
-                   "status": "ok",
-                   "index": idx,
-                   "source_url": url,
-                   "result_url": final_url if bucket else None,
-                   "result_base64": None if bucket else final_url,
-                   "storage_type": "gcs" if bucket else "data-url"
-               })
-           except Exception as e:
-               err = sanitize_text(str(e))
-               print(f"[process] error image {idx}: {err}")
-               results.append({"status": "error", "index": idx, "source_url": url, "error": err})
-
+       # Generate job ID
+       job_id = str(uuid.uuid4())
+       
+       # Start background processing
+       thread = threading.Thread(
+           target=process_in_background,
+           args=(job_id, payload)
+       )
+       thread.daemon = True
+       thread.start()
+       
+       # Return immediately to avoid timeout
        return safe_json_response({
            "success": True,
-           "count": len(results),
-           "order_id": order_id,
-           "prompt_used": (prompt.encode("ascii", "ignore").decode("ascii"))[:100],
-           "results": results
+           "job_id": job_id,
+           "status": "queued",
+           "order_id": payload.get("order_id"),
+           "message": f"Processing {len(payload.get('image_urls', []))} images in background"
        })
+       
    except Exception as e:
        err = safe_str(e)
        print(f"[process] request failed: {err}")
