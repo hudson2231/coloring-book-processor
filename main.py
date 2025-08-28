@@ -11,7 +11,7 @@ import re
 from PIL import Image
 import uuid
 
-VERSION = "cbp-v1.4-batch-single-row"
+VERSION = "cbp-v1.5-fixed-duplicates"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -307,7 +307,8 @@ def process():
                    'image_urls': batch,
                    'batch_number': (i // BATCH_SIZE) + 1,
                    'total_batches': total_batches,
-                   'batch_start_index': i
+                   'batch_start_index': i,
+                   'total_images': len(image_urls)  # Add total image count for tracking
                }
                
                task = {
@@ -359,6 +360,7 @@ def process_worker_internal(payload):
        batch_number = payload.get("batch_number", 1)
        total_batches = payload.get("total_batches", 1)
        batch_start_index = payload.get("batch_start_index", 0)
+       total_images = payload.get("total_images", len(image_urls))
        
        print(f"[worker] Processing batch {batch_number}/{total_batches} for order {order_id}: {len(image_urls)} images")
        
@@ -390,37 +392,57 @@ def process_worker_internal(payload):
            values = sheet_data.get('values', [])
            row_index = None
            existing_urls = ""
+           existing_status = ""
            
            # Find existing row for this order
            for i, row in enumerate(values):
                if row and len(row) > 0 and row[0] == order_id:
                    row_index = i + 1
                    existing_urls = row[4] if len(row) > 4 else ""
+                   existing_status = row[5] if len(row) > 5 else ""
                    break
            
-           # Combine URLs (existing + new batch)
+           # FIX 1: Remove duplicates when combining URLs
            successful_urls = [r for r in results if not r.startswith("ERROR")]
+           
            if existing_urls:
-               all_urls = existing_urls + "," + ",".join(successful_urls)
+               # Parse existing URLs and remove duplicates
+               existing_list = [u.strip() for u in existing_urls.split(',') if u.strip()]
+               # Create a set to track unique URLs
+               seen = set(existing_list)
+               # Add new URLs only if not already present
+               for new_url in successful_urls:
+                   if new_url not in seen:
+                       existing_list.append(new_url)
+                       seen.add(new_url)
+               all_urls = ','.join(existing_list)
            else:
-               all_urls = ",".join(successful_urls)
+               all_urls = ','.join(successful_urls)
            
            # Count total successful images
-           total_successful = len(all_urls.split(',')) if all_urls else 0
+           url_list = [u.strip() for u in all_urls.split(',') if u.strip()]
+           total_successful = len(url_list)
            
-           # Determine status
+           # FIX 2: Update status properly for each batch
            if batch_number == total_batches:
                status = 'complete'
-               notes = f'Processed {total_successful} images successfully'
+               notes = f'All {total_batches} batch(es) processed. {total_successful}/{total_images} images successful.'
            else:
-               status = f'processing_batch_{batch_number}/{total_batches}'
-               notes = f'Batch {batch_number}/{total_batches} complete'
+               # Check if this batch has already been processed
+               expected_status = f'processing_batch_{batch_number}/{total_batches}'
+               if existing_status and int(existing_status.split('_')[-1].split('/')[0]) >= batch_number:
+                   # This batch was already processed (retry scenario)
+                   status = existing_status  # Keep existing status
+                   notes = f'Batch {batch_number}/{total_batches} updated (retry)'
+               else:
+                   status = expected_status
+                   notes = f'Batch {batch_number}/{total_batches} complete. Processing continues...'
            
            # Prepare row data
            row_data = [
                order_id,
                payload.get('customer_name', 'N/A'),
-               payload.get('customer_email', 'N/A'),
+               payload.get('customer_email', 'N/A'),  
                payload.get('shipping_address', 'N/A'),
                all_urls,
                status,
@@ -432,7 +454,7 @@ def process_worker_internal(payload):
            
            if row_index:
                # Update existing row
-               print(f"[worker] Updating row {row_index} for order {order_id}")
+               print(f"[worker] Updating row {row_index} for order {order_id} - Status: {status}")
                service.spreadsheets().values().update(
                    spreadsheetId=spreadsheet_id,
                    range=f'A{row_index}:J{row_index}',
@@ -441,7 +463,7 @@ def process_worker_internal(payload):
                ).execute()
            else:
                # Create new row
-               print(f"[worker] Creating new row for order {order_id}")
+               print(f"[worker] Creating new row for order {order_id} - Status: {status}")
                service.spreadsheets().values().append(
                    spreadsheetId=spreadsheet_id,
                    range='A:J',
@@ -449,7 +471,7 @@ def process_worker_internal(payload):
                    body={'values': [row_data]}
                ).execute()
            
-           print(f"[worker] Batch {batch_number}/{total_batches} for order {order_id} complete. {len(results)} images processed.")
+           print(f"[worker] Batch {batch_number}/{total_batches} for order {order_id} complete. {len(successful_urls)} new images added.")
            
        except Exception as e:
            print(f"[worker] Failed to write to sheets: {safe_str(e)}")
