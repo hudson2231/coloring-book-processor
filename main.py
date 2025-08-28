@@ -11,7 +11,7 @@ import re
 from PIL import Image
 import uuid
 
-VERSION = "cbp-v1.5-fixed-duplicates"
+VERSION = "cbp-v1.6-deduplicated"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -289,7 +289,8 @@ def process():
            payload['prompt'] = request.form.get('prompt', DEFAULT_PROMPT)
        
        image_urls = payload.get('image_urls', [])
-       print(f"[process] order_id={payload.get('order_id')}, total urls={len(image_urls)}")
+       order_id = payload.get('order_id')
+       print(f"[process] order_id={order_id}, total urls={len(image_urls)}")
        
        # Split into batches
        total_batches = (len(image_urls) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -299,16 +300,18 @@ def process():
            client = tasks_v2.CloudTasksClient()
            parent = client.queue_path('coloring-book-processor', 'us-central1', 'image-processing')
            
-           # Create tasks for each batch
+           # Create tasks for each batch with deduplication
+           tasks_created = 0
            for i in range(0, len(image_urls), BATCH_SIZE):
                batch = image_urls[i:i+BATCH_SIZE]
+               batch_num = (i // BATCH_SIZE) + 1
                batch_payload = {
                    **payload,
                    'image_urls': batch,
-                   'batch_number': (i // BATCH_SIZE) + 1,
+                   'batch_number': batch_num,
                    'total_batches': total_batches,
                    'batch_start_index': i,
-                   'total_images': len(image_urls)  # Add total image count for tracking
+                   'total_images': len(image_urls)
                }
                
                task = {
@@ -320,20 +323,44 @@ def process():
                    }
                }
                
-               client.create_task(request={'parent': parent, 'task': task})
-               print(f"[process] Queued batch {(i // BATCH_SIZE) + 1}/{total_batches} with {len(batch)} images")
+               # Use deterministic task name to prevent duplicates
+               urls_hash = str(hash(''.join(batch)))[-6:]
+               task_id = f"{order_id}-b{batch_num}-{urls_hash}".replace('#', '').replace('/', '-')[:100]
+               
+               try:
+                   task_with_name = {
+                       **task,
+                       'name': f"{parent}/tasks/{task_id}"
+                   }
+                   client.create_task(parent=parent, task=task_with_name)
+                   tasks_created += 1
+                   print(f"[process] Queued batch {batch_num}/{total_batches} with task ID: {task_id}")
+               except Exception as task_error:
+                   if "already exists" in str(task_error).lower():
+                       print(f"[process] Task {task_id} already exists, skipping duplicate")
+                   else:
+                       client.create_task(parent=parent, task=task)
+                       tasks_created += 1
+                       print(f"[process] Queued batch {batch_num}/{total_batches} (unnamed)")
            
-           print(f"[process] All {total_batches} batches queued to Cloud Tasks")
+           if tasks_created == 0:
+               return safe_json_response({
+                   "success": True,
+                   "status": "already_processing",
+                   "order_id": order_id,
+                   "message": "Order is already being processed"
+               })
+           
+           print(f"[process] {tasks_created} new batches queued to Cloud Tasks")
            
        except Exception as e:
            print(f"[process] Cloud Tasks not available, processing synchronously: {safe_str(e)}")
-           # Fallback to synchronous processing if Cloud Tasks isn't set up
            return process_worker_internal(payload)
        
        return safe_json_response({
            "success": True,
            "status": "queued",
-           "order_id": payload.get("order_id"),
+           "order_id": order_id,
            "total_images": len(image_urls),
            "batches": total_batches,
            "message": f"Processing {len(image_urls)} images in {total_batches} batch(es)"
@@ -363,6 +390,27 @@ def process_worker_internal(payload):
        total_images = payload.get("total_images", len(image_urls))
        
        print(f"[worker] Processing batch {batch_number}/{total_batches} for order {order_id}: {len(image_urls)} images")
+       
+       # Early check: if this is batch 1 and order already exists as complete, skip
+       if batch_number == 1:
+           try:
+               creds = service_account.Credentials.from_service_account_file('key.json')
+               service = build('sheets', 'v4', credentials=creds)
+               spreadsheet_id = '1SQJNA4ztkUT64Pzlv0AxlpG7Rsvq9pqVnkOCGlMTIug'
+               
+               sheet_data = service.spreadsheets().values().get(
+                   spreadsheetId=spreadsheet_id,
+                   range='A:F'
+               ).execute()
+               
+               values = sheet_data.get('values', [])
+               for row in values:
+                   if row and len(row) > 0 and row[0] == order_id:
+                       if len(row) > 5 and row[5] == 'complete':
+                           print(f"[worker] Order {order_id} already complete, skipping batch {batch_number}")
+                           return safe_json_response({"success": True, "message": "Order already complete"})
+           except Exception as e:
+               print(f"[worker] Could not check existing status: {safe_str(e)}")
        
        results = []
        for idx, url in enumerate(image_urls):
@@ -402,15 +450,12 @@ def process_worker_internal(payload):
                    existing_status = row[5] if len(row) > 5 else ""
                    break
            
-           # FIX 1: Remove duplicates when combining URLs
+           # Remove duplicates when combining URLs
            successful_urls = [r for r in results if not r.startswith("ERROR")]
            
            if existing_urls:
-               # Parse existing URLs and remove duplicates
                existing_list = [u.strip() for u in existing_urls.split(',') if u.strip()]
-               # Create a set to track unique URLs
                seen = set(existing_list)
-               # Add new URLs only if not already present
                for new_url in successful_urls:
                    if new_url not in seen:
                        existing_list.append(new_url)
@@ -423,17 +468,24 @@ def process_worker_internal(payload):
            url_list = [u.strip() for u in all_urls.split(',') if u.strip()]
            total_successful = len(url_list)
            
-           # FIX 2: Update status properly for each batch
+           # Update status properly for each batch
            if batch_number == total_batches:
                status = 'complete'
                notes = f'All {total_batches} batch(es) processed. {total_successful}/{total_images} images successful.'
            else:
-               # Check if this batch has already been processed
                expected_status = f'processing_batch_{batch_number}/{total_batches}'
-               if existing_status and int(existing_status.split('_')[-1].split('/')[0]) >= batch_number:
-                   # This batch was already processed (retry scenario)
-                   status = existing_status  # Keep existing status
-                   notes = f'Batch {batch_number}/{total_batches} updated (retry)'
+               if existing_status and 'processing_batch_' in existing_status:
+                   try:
+                       existing_batch = int(existing_status.split('_')[-1].split('/')[0])
+                       if existing_batch >= batch_number:
+                           status = existing_status
+                           notes = f'Batch {batch_number}/{total_batches} updated (retry)'
+                       else:
+                           status = expected_status
+                           notes = f'Batch {batch_number}/{total_batches} complete. Processing continues...'
+                   except:
+                       status = expected_status
+                       notes = f'Batch {batch_number}/{total_batches} complete. Processing continues...'
                else:
                    status = expected_status
                    notes = f'Batch {batch_number}/{total_batches} complete. Processing continues...'
@@ -453,7 +505,6 @@ def process_worker_internal(payload):
            ]
            
            if row_index:
-               # Update existing row
                print(f"[worker] Updating row {row_index} for order {order_id} - Status: {status}")
                service.spreadsheets().values().update(
                    spreadsheetId=spreadsheet_id,
@@ -462,7 +513,6 @@ def process_worker_internal(payload):
                    body={'values': [row_data]}
                ).execute()
            else:
-               # Create new row
                print(f"[worker] Creating new row for order {order_id} - Status: {status}")
                service.spreadsheets().values().append(
                    spreadsheetId=spreadsheet_id,
