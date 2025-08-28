@@ -11,7 +11,7 @@ import re
 from PIL import Image
 import uuid
 
-VERSION = "cbp-v1.3-cloud-tasks"
+VERSION = "cbp-v1.4-batch-single-row"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -23,6 +23,9 @@ os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
 
 app = Flask(__name__)
+
+# Batch configuration
+BATCH_SIZE = 8  # Process 8 images per batch to stay under timeout
 
 # ---------- Utilities ----------
 def safe_str(obj):
@@ -285,24 +288,41 @@ def process():
            payload['image_urls'] = image_urls
            payload['prompt'] = request.form.get('prompt', DEFAULT_PROMPT)
        
-       print(f"[process] order_id={payload.get('order_id')}, urls={len(payload.get('image_urls', []))}")
+       image_urls = payload.get('image_urls', [])
+       print(f"[process] order_id={payload.get('order_id')}, total urls={len(image_urls)}")
+       
+       # Split into batches
+       total_batches = (len(image_urls) + BATCH_SIZE - 1) // BATCH_SIZE
        
        # Queue to Cloud Tasks
        try:
            client = tasks_v2.CloudTasksClient()
            parent = client.queue_path('coloring-book-processor', 'us-central1', 'image-processing')
            
-           task = {
-               'http_request': {
-                   'http_method': tasks_v2.HttpMethod.POST,
-                   'url': 'https://coloring-book-processor-585071603431.us-central1.run.app/process-worker',
-                   'headers': {'Content-Type': 'application/json'},
-                   'body': json.dumps(payload).encode()
+           # Create tasks for each batch
+           for i in range(0, len(image_urls), BATCH_SIZE):
+               batch = image_urls[i:i+BATCH_SIZE]
+               batch_payload = {
+                   **payload,
+                   'image_urls': batch,
+                   'batch_number': (i // BATCH_SIZE) + 1,
+                   'total_batches': total_batches,
+                   'batch_start_index': i
                }
-           }
+               
+               task = {
+                   'http_request': {
+                       'http_method': tasks_v2.HttpMethod.POST,
+                       'url': 'https://coloring-book-processor-585071603431.us-central1.run.app/process-worker',
+                       'headers': {'Content-Type': 'application/json'},
+                       'body': json.dumps(batch_payload).encode()
+                   }
+               }
+               
+               client.create_task(request={'parent': parent, 'task': task})
+               print(f"[process] Queued batch {(i // BATCH_SIZE) + 1}/{total_batches} with {len(batch)} images")
            
-           client.create_task(request={'parent': parent, 'task': task})
-           print(f"[process] Queued to Cloud Tasks")
+           print(f"[process] All {total_batches} batches queued to Cloud Tasks")
            
        except Exception as e:
            print(f"[process] Cloud Tasks not available, processing synchronously: {safe_str(e)}")
@@ -313,7 +333,9 @@ def process():
            "success": True,
            "status": "queued",
            "order_id": payload.get("order_id"),
-           "message": f"Processing {len(payload.get('image_urls', []))} images"
+           "total_images": len(image_urls),
+           "batches": total_batches,
+           "message": f"Processing {len(image_urls)} images in {total_batches} batch(es)"
        })
        
    except Exception as e:
@@ -334,50 +356,105 @@ def process_worker_internal(payload):
        order_id = payload.get("order_id", f"order_{int(time.time())}")
        image_urls = payload.get("image_urls", [])
        prompt = payload.get("prompt", DEFAULT_PROMPT)
+       batch_number = payload.get("batch_number", 1)
+       total_batches = payload.get("total_batches", 1)
+       batch_start_index = payload.get("batch_start_index", 0)
        
-       print(f"[worker] Processing {len(image_urls)} images for order {order_id}")
+       print(f"[worker] Processing batch {batch_number}/{total_batches} for order {order_id}: {len(image_urls)} images")
        
        results = []
        for idx, url in enumerate(image_urls):
            try:
-               print(f"[worker] Processing image {idx+1}/{len(image_urls)}")
+               actual_idx = batch_start_index + idx
+               print(f"[worker] Processing image {idx+1}/{len(image_urls)} (overall #{actual_idx+1})")
                raw = download_image(url)
                edited = call_openai_edit(raw, prompt)
-               final_url = upload_to_gcs(order_id, idx, edited)
+               final_url = upload_to_gcs(order_id, actual_idx, edited)
                results.append(final_url)
            except Exception as e:
                print(f"[worker] Error processing image {idx}: {safe_str(e)}")
                results.append(f"ERROR: {safe_str(e)}")
        
-       # Write to Google Sheets
+       # Update Google Sheets - either update existing row or create new
        try:
            creds = service_account.Credentials.from_service_account_file('key.json')
            service = build('sheets', 'v4', credentials=creds)
+           spreadsheet_id = '1SQJNA4ztkUT64Pzlv0AxlpG7Rsvq9pqVnkOCGlMTIug'
            
-           service.spreadsheets().values().append(
-               spreadsheetId='1SQJNA4ztkUT64Pzlv0AxlpG7Rsvq9pqVnkOCGlMTIug',
-               range='A:J',
-               valueInputOption='RAW',
-               body={'values': [[
-                   order_id,
-                   payload.get('customer_name', 'N/A'),
-                   payload.get('customer_email', 'N/A'),
-                   payload.get('shipping_address', 'N/A'),
-                   ','.join([r for r in results if not r.startswith("ERROR")]),
-                   'needs_review',
-                   time.strftime('%Y-%m-%d %H:%M:%S'),
-                   len([r for r in results if not r.startswith("ERROR")]),
-                   payload.get('shopify_order_number', order_id),
-                   'Processed successfully' if all(not r.startswith("ERROR") for r in results) else 'Some images failed'
-               ]]}
+           # Read existing data to find the row
+           sheet_data = service.spreadsheets().values().get(
+               spreadsheetId=spreadsheet_id,
+               range='A:J'
            ).execute()
            
-           print(f"[worker] Order {order_id} complete. {len(results)} images processed, saved to sheets.")
+           values = sheet_data.get('values', [])
+           row_index = None
+           existing_urls = ""
+           
+           # Find existing row for this order
+           for i, row in enumerate(values):
+               if row and len(row) > 0 and row[0] == order_id:
+                   row_index = i + 1
+                   existing_urls = row[4] if len(row) > 4 else ""
+                   break
+           
+           # Combine URLs (existing + new batch)
+           successful_urls = [r for r in results if not r.startswith("ERROR")]
+           if existing_urls:
+               all_urls = existing_urls + "," + ",".join(successful_urls)
+           else:
+               all_urls = ",".join(successful_urls)
+           
+           # Count total successful images
+           total_successful = len(all_urls.split(',')) if all_urls else 0
+           
+           # Determine status
+           if batch_number == total_batches:
+               status = 'complete'
+               notes = f'Processed {total_successful} images successfully'
+           else:
+               status = f'processing_batch_{batch_number}/{total_batches}'
+               notes = f'Batch {batch_number}/{total_batches} complete'
+           
+           # Prepare row data
+           row_data = [
+               order_id,
+               payload.get('customer_name', 'N/A'),
+               payload.get('customer_email', 'N/A'),
+               payload.get('shipping_address', 'N/A'),
+               all_urls,
+               status,
+               time.strftime('%Y-%m-%d %H:%M:%S'),
+               total_successful,
+               payload.get('shopify_order_number', order_id),
+               notes
+           ]
+           
+           if row_index:
+               # Update existing row
+               print(f"[worker] Updating row {row_index} for order {order_id}")
+               service.spreadsheets().values().update(
+                   spreadsheetId=spreadsheet_id,
+                   range=f'A{row_index}:J{row_index}',
+                   valueInputOption='RAW',
+                   body={'values': [row_data]}
+               ).execute()
+           else:
+               # Create new row
+               print(f"[worker] Creating new row for order {order_id}")
+               service.spreadsheets().values().append(
+                   spreadsheetId=spreadsheet_id,
+                   range='A:J',
+                   valueInputOption='RAW',
+                   body={'values': [row_data]}
+               ).execute()
+           
+           print(f"[worker] Batch {batch_number}/{total_batches} for order {order_id} complete. {len(results)} images processed.")
            
        except Exception as e:
            print(f"[worker] Failed to write to sheets: {safe_str(e)}")
        
-       return safe_json_response({"success": True, "results": results})
+       return safe_json_response({"success": True, "batch": batch_number, "results": results})
        
    except Exception as e:
        print(f"[worker] Job failed: {safe_str(e)}")
