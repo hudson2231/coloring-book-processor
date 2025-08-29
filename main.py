@@ -10,8 +10,9 @@ from google.cloud import tasks_v2
 import re
 from PIL import Image
 import uuid
+import img2pdf
 
-VERSION = "cbp-v1.6-deduplicated"
+VERSION = "cbp-v1.7-lulu"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -83,6 +84,10 @@ DEFAULT_PROMPT = (
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 REQUEST_TIMEOUT = 30
 OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT", "300"))
+
+# Lulu configuration
+LULU_CLIENT_ID = os.environ.get('LULU_CLIENT_ID')
+LULU_CLIENT_SECRET = os.environ.get('LULU_CLIENT_SECRET')
 
 # ---------- GCS client ----------
 try:
@@ -268,6 +273,142 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
        url = f"https://storage.googleapis.com/{bucket.name}/{blob_name}"
    return url
 
+# ---------- Lulu Integration ----------
+def get_lulu_token():
+    """Get OAuth token from Lulu"""
+    if not LULU_CLIENT_ID or not LULU_CLIENT_SECRET:
+        raise Exception("Lulu credentials not configured")
+    
+    response = requests.post(
+        'https://api.lulu.com/auth/realms/glasstree/protocol/openid-connect/token',
+        data={
+            'grant_type': 'client_credentials',
+            'client_id': LULU_CLIENT_ID,
+            'client_secret': LULU_CLIENT_SECRET
+        }
+    )
+    if response.status_code != 200:
+        raise Exception(f"Lulu auth failed: {response.text}")
+    return response.json()['access_token']
+
+@app.route("/send-to-lulu", methods=["POST"])
+def send_to_lulu():
+    try:
+        # Get data from Zapier
+        data = request.get_json(force=True, silent=True) or {}
+        
+        # Parse the image URLs
+        image_urls_str = data.get('image_urls', '')
+        if isinstance(image_urls_str, list):
+            image_urls = image_urls_str
+        else:
+            image_urls = [u.strip() for u in image_urls_str.split(',') if u.strip()]
+        
+        order_id = data.get('order_id', f"order_{int(time.time())}")
+        
+        # Download and prepare images
+        images = []
+        for url in image_urls:
+            if url and not url.startswith("ERROR"):
+                try:
+                    img_bytes = download_image(url)
+                    img = Image.open(io.BytesIO(img_bytes))
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    # Resize to 8.5x11 at 300 DPI
+                    img = img.resize((2550, 3300), Image.Resampling.LANCZOS)
+                    
+                    # Save to bytes
+                    img_buffer = io.BytesIO()
+                    img.save(img_buffer, format='PNG')
+                    images.append(img_buffer.getvalue())
+                except Exception as e:
+                    print(f"[lulu] Failed to process image {url}: {safe_str(e)}")
+        
+        if not images:
+            return safe_json_response({"success": False, "error": "No valid images to process"}, 400)
+        
+        # Create PDF
+        pdf_bytes = img2pdf.convert(images)
+        
+        # Determine product based on page count
+        page_count = len(images) * 2  # Single-sided
+        if page_count <= 20:
+            pod_package_id = '0850X1100BWSTDPB060UW444MXX'  # 20 page saddle stitch
+        elif page_count <= 40:
+            pod_package_id = '0850X1100BWSTDPB060UW444MXX'  # 40 page saddle stitch
+        else:
+            pod_package_id = '0850X1100BWSTDPB060UW444MXX'  # 60 page perfect bound
+        
+        # Get Lulu token
+        token = get_lulu_token()
+        
+        # Create print job
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Parse address
+        shipping_address = data.get('shipping_address', '')
+        customer_name = data.get('customer_name', 'Customer')
+        customer_email = data.get('customer_email', '')
+        
+        # Simple address parsing (expecting: "Street, City, State, ZIP, Country")
+        addr_parts = [p.strip() for p in shipping_address.split(',')]
+        
+        # Upload PDF and create order
+        files = {
+            'file': ('book.pdf', pdf_bytes, 'application/pdf')
+        }
+        
+        order_data = {
+            'line_items': [{
+                'page_count': page_count,
+                'pod_package_id': pod_package_id,
+                'quantity': 1
+            }],
+            'shipping_address': {
+                'name': customer_name,
+                'street1': addr_parts[0] if len(addr_parts) > 0 else '',
+                'city': addr_parts[1] if len(addr_parts) > 1 else '',
+                'state_code': addr_parts[2] if len(addr_parts) > 2 else '',
+                'postcode': addr_parts[3] if len(addr_parts) > 3 else '',
+                'country_code': addr_parts[4] if len(addr_parts) > 4 else 'US',
+                'email': customer_email,
+                'phone': data.get('phone', '')
+            },
+            'shipping_level': 'STANDARD'
+        }
+        
+        # Create the print job
+        response = requests.post(
+            'https://api.lulu.com/print-jobs/',
+            headers=headers,
+            files=files,
+            data={'print_job': json.dumps(order_data)}
+        )
+        
+        if response.status_code in [200, 201]:
+            lulu_order = response.json()
+            return safe_json_response({
+                'success': True,
+                'lulu_order_id': lulu_order.get('id', 'unknown'),
+                'status': 'sent_to_lulu'
+            })
+        else:
+            return safe_json_response({
+                'success': False,
+                'error': f"Lulu API error: {response.text}"
+            }, 500)
+            
+    except Exception as e:
+        print(f"[lulu] Error: {safe_str(e)}")
+        return safe_json_response({
+            'success': False,
+            'error': safe_str(e)
+        }, 500)
+
 # ---------- Routes ----------
 @app.route("/process", methods=["POST"])
 def process():
@@ -434,7 +575,7 @@ def process_worker_internal(payload):
            # Read existing data to find the row
            sheet_data = service.spreadsheets().values().get(
                spreadsheetId=spreadsheet_id,
-               range='A:J'
+               range='A:M'
            ).execute()
            
            values = sheet_data.get('values', [])
@@ -490,25 +631,28 @@ def process_worker_internal(payload):
                    status = expected_status
                    notes = f'Batch {batch_number}/{total_batches} complete. Processing continues...'
            
-           # Prepare row data
+           # Prepare row data with POD columns
            row_data = [
-               order_id,
-               payload.get('customer_name', 'N/A'),
-               payload.get('customer_email', 'N/A'),  
-               payload.get('shipping_address', 'N/A'),
-               all_urls,
-               status,
-               time.strftime('%Y-%m-%d %H:%M:%S'),
-               total_successful,
-               payload.get('shopify_order_number', order_id),
-               notes
+               order_id,                          # A
+               payload.get('customer_name', 'N/A'),  # B
+               payload.get('customer_email', 'N/A'), # C
+               payload.get('shipping_address', 'N/A'), # D
+               all_urls,                          # E
+               status,                            # F
+               time.strftime('%Y-%m-%d %H:%M:%S'), # G
+               total_successful,                  # H
+               payload.get('shopify_order_number', order_id), # I
+               notes,                             # J
+               'FALSE',                           # K - Send to POD checkbox
+               '',                                # L - Lulu Order ID
+               ''                                 # M - POD Date
            ]
            
            if row_index:
                print(f"[worker] Updating row {row_index} for order {order_id} - Status: {status}")
                service.spreadsheets().values().update(
                    spreadsheetId=spreadsheet_id,
-                   range=f'A{row_index}:J{row_index}',
+                   range=f'A{row_index}:M{row_index}',
                    valueInputOption='RAW',
                    body={'values': [row_data]}
                ).execute()
@@ -516,7 +660,7 @@ def process_worker_internal(payload):
                print(f"[worker] Creating new row for order {order_id} - Status: {status}")
                service.spreadsheets().values().append(
                    spreadsheetId=spreadsheet_id,
-                   range='A:J',
+                   range='A:M',
                    valueInputOption='RAW',
                    body={'values': [row_data]}
                ).execute()
@@ -556,6 +700,7 @@ def health():
        "service": "coloring-book-processor",
        "gcs_available": bucket is not None,
        "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
+       "lulu_configured": bool(LULU_CLIENT_ID and LULU_CLIENT_SECRET),
        "bucket_name": bucket_name,
        "version": VERSION
    })
@@ -567,6 +712,7 @@ def index():
        "endpoints": {
            "/process": "POST - Process images to line art",
            "/process-worker": "POST - Worker endpoint for Cloud Tasks",
+           "/send-to-lulu": "POST - Send to Lulu for printing",
            "/test": "GET/POST - Test with sample image",
            "/health": "GET - Health check",
            "/": "GET - This help"
