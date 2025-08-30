@@ -257,20 +257,8 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
    blob.cache_control = "public, max-age=31536000, immutable"
    blob.upload_from_string(img_bytes, content_type="image/png")
    
-   try:
-       blob.patch()
-   except Exception as e:
-       print(f"[gcs] patch failed: {safe_str(e)}")
-   try:
-       blob.make_public()
-   except Exception as e:
-       print(f"[gcs] make_public failed: {safe_str(e)}")
-
-   url = blob.public_url
-   if isinstance(url, bytes):
-       url = url.decode("utf-8", "ignore")
-   if not url or url.startswith("gs://"):
-       url = f"https://storage.googleapis.com/{bucket.name}/{blob_name}"
+   # Always construct URL manually
+   url = f"https://storage.googleapis.com/{bucket.name}/{blob_name}"
    return url
 
 # ---------- Lulu Integration ----------
@@ -532,12 +520,14 @@ def process_worker_internal(payload):
        
        print(f"[worker] Processing batch {batch_number}/{total_batches} for order {order_id}: {len(image_urls)} images")
        
+       # NEW SPREADSHEET ID
+       spreadsheet_id = '1fVKN0Lf6FHnfFvNZW80nNuxn_Vx3HHHR0cbwcfj5gwc'
+       
        # Early check: if this is batch 1 and order already exists as complete, skip
        if batch_number == 1:
            try:
                creds = service_account.Credentials.from_service_account_file('key.json')
                service = build('sheets', 'v4', credentials=creds)
-               spreadsheet_id = '1SQJNA4ztkUT64Pzlv0AxlpG7Rsvq9pqVnkOCGlMTIug'
                
                sheet_data = service.spreadsheets().values().get(
                    spreadsheetId=spreadsheet_id,
@@ -570,7 +560,6 @@ def process_worker_internal(payload):
        try:
            creds = service_account.Credentials.from_service_account_file('key.json')
            service = build('sheets', 'v4', credentials=creds)
-           spreadsheet_id = '1SQJNA4ztkUT64Pzlv0AxlpG7Rsvq9pqVnkOCGlMTIug'
            
            # Read existing data to find the row
            sheet_data = service.spreadsheets().values().get(
@@ -643,7 +632,7 @@ def process_worker_internal(payload):
                total_successful,                  # H
                payload.get('shopify_order_number', order_id), # I
                notes,                             # J
-               'FALSE',                           # K - Send to POD checkbox
+               'FALSE',                           # K - Send to POD
                '',                                # L - Lulu Order ID
                ''                                 # M - POD Date
            ]
