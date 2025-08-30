@@ -331,12 +331,6 @@ def send_to_lulu():
         # Get Lulu token
         token = get_lulu_token()
         
-        # Create print job
-        headers = {
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json'
-        }
-        
         # Parse address
         shipping_address = data.get('shipping_address', '')
         customer_name = data.get('customer_name', 'Customer')
@@ -344,11 +338,6 @@ def send_to_lulu():
         
         # Simple address parsing (expecting: "Street, City, State, ZIP, Country")
         addr_parts = [p.strip() for p in shipping_address.split(',')]
-        
-        # Upload PDF and create order
-        files = {
-            'file': ('book.pdf', pdf_bytes, 'application/pdf')
-        }
         
         order_data = {
             'line_items': [{
@@ -369,12 +358,17 @@ def send_to_lulu():
             'shipping_level': 'STANDARD'
         }
         
+        # Prepare multipart properly - THIS IS THE FIX
+        files = [
+            ('file', ('book.pdf', pdf_bytes, 'application/pdf')),
+            ('print_job', (None, json.dumps(order_data), 'application/json'))
+        ]
+        
         # Create the print job
         response = requests.post(
             'https://api.lulu.com/print-jobs/',
-            headers=headers,
-            files=files,
-            data={'print_job': json.dumps(order_data)}
+            headers={'Authorization': f'Bearer {token}'},
+            files=files
         )
         
         if response.status_code in [200, 201]:
