@@ -12,7 +12,7 @@ from PIL import Image
 import uuid
 import img2pdf
 
-VERSION = "cbp-v1.8-lulu-debug"
+VERSION = "cbp-v1.8-lulu-minpages"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -319,8 +319,9 @@ def send_to_lulu():
         # Create PDF
         pdf_bytes = img2pdf.convert(images)
         
-        # Updated pod_package_id from Lulu's pricing calculator
-        page_count = len(images) * 2  # Single-sided
+        # Set minimum page count for Lulu (saddle stitch minimum is usually 20-24)
+        actual_pages = len(images)
+        page_count = max(24, actual_pages * 2)  # Minimum 24 pages, or double the image count
         pod_package_id = '0600X0900BWSTDSS060UW444MXX'  # 6x9, B&W, Saddle Stitch, 60# White
         
         # Get Lulu token
@@ -357,7 +358,8 @@ def send_to_lulu():
         print(f"[lulu] Sending request to Lulu API")
         print(f"[lulu] Order data: {json.dumps(order_data, indent=2)}")
         print(f"[lulu] PDF size: {len(pdf_bytes)} bytes")
-        print(f"[lulu] Page count: {page_count}")
+        print(f"[lulu] Actual pages in PDF: {actual_pages}")
+        print(f"[lulu] Page count sent to Lulu: {page_count}")
         print(f"[lulu] Pod package ID: {pod_package_id}")
         
         # Prepare multipart properly
