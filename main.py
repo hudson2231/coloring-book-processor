@@ -10,9 +10,10 @@ from google.cloud import tasks_v2
 import re
 from PIL import Image
 import uuid
-import img2pdf
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.8-lulu-blankpages"
+VERSION = "cbp-v1.9-lulu-reportlab"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -88,6 +89,7 @@ OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT", "300"))
 # Lulu configuration
 LULU_CLIENT_ID = os.environ.get('LULU_CLIENT_ID')
 LULU_CLIENT_SECRET = os.environ.get('LULU_CLIENT_SECRET')
+LULU_USE_SANDBOX = os.environ.get('LULU_USE_SANDBOX', 'true').lower() == 'true'
 
 # ---------- GCS client ----------
 try:
@@ -308,7 +310,7 @@ def send_to_lulu():
                     
                     # Save to bytes
                     img_buffer = io.BytesIO()
-                    img.save(img_buffer, format='PNG')
+                    img.save(img_buffer, format='PNG', dpi=(300, 300))
                     images.append(img_buffer.getvalue())
                 except Exception as e:
                     print(f"[lulu] Failed to process image {url}: {safe_str(e)}")
@@ -322,12 +324,21 @@ def send_to_lulu():
             # Create a blank white page
             blank = Image.new('RGB', (1800, 2700), 'white')
             blank_buffer = io.BytesIO()
-            blank.save(blank_buffer, format='PNG')
+            blank.save(blank_buffer, format='PNG', dpi=(300, 300))
             images.append(blank_buffer.getvalue())
             print(f"[lulu] Added blank page {len(images)}/12")
         
-        # Create PDF with all pages (including blanks)
-        pdf_bytes = img2pdf.convert(images)
+        # Create PDF with ReportLab for proper formatting
+        pdf_buffer = io.BytesIO()
+        c = canvas.Canvas(pdf_buffer, pagesize=(6*72, 9*72))  # 6x9 inches at 72 points/inch
+        
+        for img_bytes in images:
+            img_reader = ImageReader(io.BytesIO(img_bytes))
+            c.drawImage(img_reader, 0, 0, width=6*72, height=9*72, preserveAspectRatio=True)
+            c.showPage()
+        
+        c.save()
+        pdf_bytes = pdf_buffer.getvalue()
         
         # Page count should now match what we tell Lulu
         page_count = len(images) * 2  # Double-sided pages
@@ -344,8 +355,11 @@ def send_to_lulu():
         # Simple address parsing (expecting: "Street, City, State, ZIP, Country")
         addr_parts = [p.strip() for p in shipping_address.split(',')]
         
+        # More complete order data with all possible fields
         order_data = {
+            'external_id': order_id,  # Added external_id
             'line_items': [{
+                'title': f'Memory Book - {order_id}',  # Added title
                 'page_count': page_count,
                 'pod_package_id': pod_package_id,
                 'quantity': 1
@@ -358,13 +372,21 @@ def send_to_lulu():
                 'postcode': addr_parts[3] if len(addr_parts) > 3 else '',
                 'country_code': addr_parts[4] if len(addr_parts) > 4 else 'US',
                 'email': customer_email,
-                'phone': data.get('phone', '')
+                'phone_number': data.get('phone', '')  # Changed to phone_number
             },
-            'shipping_level': 'STANDARD'
+            'shipping_level': 'MAIL'  # Changed to MAIL
         }
         
+        # Determine endpoint based on sandbox setting
+        if LULU_USE_SANDBOX:
+            api_url = 'https://api.sandbox.lulu.com/print-jobs/'
+            print(f"[lulu] Using SANDBOX endpoint")
+        else:
+            api_url = 'https://api.lulu.com/print-jobs/'
+            print(f"[lulu] Using PRODUCTION endpoint")
+        
         # Add detailed logging
-        print(f"[lulu] Sending request to Lulu API")
+        print(f"[lulu] Sending request to Lulu API: {api_url}")
         print(f"[lulu] Order data: {json.dumps(order_data, indent=2)}")
         print(f"[lulu] PDF size: {len(pdf_bytes)} bytes")
         print(f"[lulu] Original images: {original_count}, Total pages in PDF: {len(images)}")
@@ -379,7 +401,7 @@ def send_to_lulu():
         
         # Create the print job
         response = requests.post(
-            'https://api.lulu.com/print-jobs/',
+            api_url,
             headers={'Authorization': f'Bearer {token}'},
             files=files
         )
@@ -705,7 +727,8 @@ def health():
        "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
        "lulu_configured": bool(LULU_CLIENT_ID and LULU_CLIENT_SECRET),
        "bucket_name": bucket_name,
-       "version": VERSION
+       "version": VERSION,
+       "lulu_mode": "SANDBOX" if LULU_USE_SANDBOX else "PRODUCTION"
    })
 
 @app.route("/", methods=["GET"])
