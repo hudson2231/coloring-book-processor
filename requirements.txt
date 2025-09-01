@@ -3,7 +3,7 @@ gunicorn==21.2.0
 google-cloud-storage==2.10.0
 google-cloud-tasks==2.14.2
 openai==0.27.8
-Pillow==10.0.0
+Pillow==11.0.0
 pillow-heif==0.13.0
 google-auth==2.22.0
 google-api-python-client==2.97.0
