@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.13-shopify-hash-fix"
+VERSION = "cbp-v1.14-url-validation-fix"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -254,7 +254,7 @@ def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
        b64 = base64.b64encode(img_bytes).decode("utf-8")
        return f"data:image/png;base64,{b64}"
 
-   # FIXED: Strip the # from Shopify order numbers
+   # Strip the # from Shopify order numbers
    order_id = order_id.replace("#", "")
    
    blob_name = f"{order_id}/{int(time.time())}_{idx}.png"
@@ -303,12 +303,15 @@ def send_to_lulu():
         # Get data from Zapier
         data = request.get_json(force=True, silent=True) or {}
         
-        # Parse the image URLs - FIX THE HASH IN URLS
+        # Parse the image URLs - FIX THE HASH IN URLS and filter out non-URLs
         image_urls_str = data.get('image_urls', '')
         if isinstance(image_urls_str, list):
-            image_urls = [url.replace("#", "") for url in image_urls_str]
+            image_urls = [url.replace("#", "") for url in image_urls_str if url.startswith('http')]
         else:
-            image_urls = [u.strip().replace("#", "") for u in image_urls_str.split(',') if u.strip()]
+            # Handle both comma and newline separators, filter for valid URLs only
+            separator = '\n' if '\n' in image_urls_str else ','
+            image_urls = [u.strip().replace("#", "") for u in image_urls_str.split(separator) 
+                         if u.strip() and u.strip().startswith('http')]
         
         order_id = data.get('order_id', f"order_{int(time.time())}").replace("#", "")
         
@@ -364,7 +367,7 @@ def send_to_lulu():
         print(f"[lulu] Interior PDF uploaded: {pdf_url}")
         
         # Create and upload a simple cover PDF  
-        # FIX: For saddle stitch, cover needs to be double width
+        # For saddle stitch, cover needs to be double width
         cover_buffer = io.BytesIO()
         cover_canvas = canvas.Canvas(cover_buffer, pagesize=(12.188*72, 9.188*72))  # Full spread for saddle stitch
         cover_canvas.setFillColorRGB(1, 1, 1)  # White background
@@ -657,19 +660,21 @@ def process_worker_internal(payload):
                    existing_status = row[5] if len(row) > 5 else ""
                    break
            
-           # Remove duplicates when combining URLs
-           successful_urls = [r for r in results if not r.startswith("ERROR")]
+           # FIXED: Filter out non-URL text and errors when combining URLs
+           successful_urls = [r for r in results if not r.startswith("ERROR") and r.startswith("http")]
            
            if existing_urls:
-               existing_list = [u.strip() for u in existing_urls.split(',') if u.strip()]
+               # Only keep valid URLs that start with http
+               existing_list = [u.strip() for u in existing_urls.split(',') if u.strip() and u.strip().startswith('http')]
                seen = set(existing_list)
                for new_url in successful_urls:
-                   if new_url not in seen:
+                   if new_url not in seen and new_url.startswith('http'):
                        existing_list.append(new_url)
                        seen.add(new_url)
                all_urls = ','.join(existing_list)
            else:
-               all_urls = ','.join(successful_urls)
+               # Filter successful URLs to only include valid URLs
+               all_urls = ','.join([u for u in successful_urls if u.startswith('http')])
            
            # Count total successful images
            url_list = [u.strip() for u in all_urls.split(',') if u.strip()]
