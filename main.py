@@ -12,7 +12,7 @@ from PIL import Image
 import uuid
 import img2pdf
 
-VERSION = "cbp-v1.8-lulu"
+VERSION = "cbp-v1.8-lulu-debug"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -353,6 +353,13 @@ def send_to_lulu():
             'shipping_level': 'STANDARD'
         }
         
+        # Add detailed logging
+        print(f"[lulu] Sending request to Lulu API")
+        print(f"[lulu] Order data: {json.dumps(order_data, indent=2)}")
+        print(f"[lulu] PDF size: {len(pdf_bytes)} bytes")
+        print(f"[lulu] Page count: {page_count}")
+        print(f"[lulu] Pod package ID: {pod_package_id}")
+        
         # Prepare multipart properly
         files = [
             ('file', ('book.pdf', pdf_bytes, 'application/pdf')),
@@ -365,6 +372,11 @@ def send_to_lulu():
             headers={'Authorization': f'Bearer {token}'},
             files=files
         )
+        
+        # Log response details
+        print(f"[lulu] Response status: {response.status_code}")
+        print(f"[lulu] Response headers: {dict(response.headers)}")
+        print(f"[lulu] Response text (first 1000 chars): {response.text[:1000]}")
         
         if response.status_code in [200, 201]:
             lulu_order = response.json()
@@ -381,6 +393,8 @@ def send_to_lulu():
             
     except Exception as e:
         print(f"[lulu] Error: {safe_str(e)}")
+        import traceback
+        print(f"[lulu] Traceback: {traceback.format_exc()}")
         return safe_json_response({
             'success': False,
             'error': safe_str(e)
