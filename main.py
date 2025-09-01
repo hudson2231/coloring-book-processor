@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.11-lulu-auth-fix"
+VERSION = "cbp-v1.12-lulu-whitespace-fix"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -269,19 +269,19 @@ def get_lulu_token():
    if not LULU_CLIENT_ID or not LULU_CLIENT_SECRET:
        raise Exception("Lulu credentials not configured")
    
-   # FIXED: Create Basic Auth header by base64 encoding client_id:client_secret
-   auth_string = f"{LULU_CLIENT_ID}:{LULU_CLIENT_SECRET}"
-   auth_bytes = auth_string.encode('utf-8')
-   auth_b64 = base64.b64encode(auth_bytes).decode('utf-8')
+   # FIXED: Strip whitespace from credentials
+   client_id = LULU_CLIENT_ID.strip()
+   client_secret = LULU_CLIENT_SECRET.strip()
    
    response = requests.post(
        'https://api.lulu.com/auth/realms/glasstree/protocol/openid-connect/token',
        data={
-           'grant_type': 'client_credentials'
+           'grant_type': 'client_credentials',
+           'client_id': client_id,
+           'client_secret': client_secret
        },
        headers={
-           'Content-Type': 'application/x-www-form-urlencoded',
-           'Authorization': f'Basic {auth_b64}'
+           'Content-Type': 'application/x-www-form-urlencoded'
        }
    )
    
