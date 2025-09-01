@@ -12,7 +12,7 @@ from PIL import Image
 import uuid
 import img2pdf
 
-VERSION = "cbp-v1.8-lulu-minpages"
+VERSION = "cbp-v1.8-lulu-blankpages"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -316,12 +316,21 @@ def send_to_lulu():
         if not images:
             return safe_json_response({"success": False, "error": "No valid images to process"}, 400)
         
-        # Create PDF
+        # Add blank pages to reach minimum page count (24 pages = 12 images)
+        original_count = len(images)
+        while len(images) < 12:
+            # Create a blank white page
+            blank = Image.new('RGB', (1800, 2700), 'white')
+            blank_buffer = io.BytesIO()
+            blank.save(blank_buffer, format='PNG')
+            images.append(blank_buffer.getvalue())
+            print(f"[lulu] Added blank page {len(images)}/12")
+        
+        # Create PDF with all pages (including blanks)
         pdf_bytes = img2pdf.convert(images)
         
-        # Set minimum page count for Lulu (saddle stitch minimum is usually 20-24)
-        actual_pages = len(images)
-        page_count = max(24, actual_pages * 2)  # Minimum 24 pages, or double the image count
+        # Page count should now match what we tell Lulu
+        page_count = len(images) * 2  # Double-sided pages
         pod_package_id = '0600X0900BWSTDSS060UW444MXX'  # 6x9, B&W, Saddle Stitch, 60# White
         
         # Get Lulu token
@@ -358,7 +367,7 @@ def send_to_lulu():
         print(f"[lulu] Sending request to Lulu API")
         print(f"[lulu] Order data: {json.dumps(order_data, indent=2)}")
         print(f"[lulu] PDF size: {len(pdf_bytes)} bytes")
-        print(f"[lulu] Actual pages in PDF: {actual_pages}")
+        print(f"[lulu] Original images: {original_count}, Total pages in PDF: {len(images)}")
         print(f"[lulu] Page count sent to Lulu: {page_count}")
         print(f"[lulu] Pod package ID: {pod_package_id}")
         
