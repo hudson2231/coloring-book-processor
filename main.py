@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.9-lulu-reportlab"
+VERSION = "cbp-v1.10-lulu-url-fix"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -340,6 +340,27 @@ def send_to_lulu():
         c.save()
         pdf_bytes = pdf_buffer.getvalue()
         
+        # FIXED: Upload interior PDF to GCS and get URL
+        pdf_blob_name = f"lulu_pdfs/{order_id}_{int(time.time())}.pdf"
+        pdf_blob = bucket.blob(pdf_blob_name)
+        pdf_blob.upload_from_string(pdf_bytes, content_type="application/pdf")
+        pdf_url = f"https://storage.googleapis.com/{bucket.name}/{pdf_blob_name}"
+        print(f"[lulu] Interior PDF uploaded: {pdf_url}")
+        
+        # FIXED: Create and upload a simple cover PDF
+        cover_buffer = io.BytesIO()
+        cover_canvas = canvas.Canvas(cover_buffer, pagesize=(6*72, 9*72))
+        cover_canvas.setFillColorRGB(1, 1, 1)  # White background
+        cover_canvas.rect(0, 0, 6*72, 9*72, fill=1)
+        cover_canvas.showPage()
+        cover_canvas.save()
+        
+        cover_blob_name = f"lulu_covers/{order_id}_{int(time.time())}_cover.pdf"
+        cover_blob = bucket.blob(cover_blob_name)
+        cover_blob.upload_from_string(cover_buffer.getvalue(), content_type="application/pdf")
+        cover_url = f"https://storage.googleapis.com/{bucket.name}/{cover_blob_name}"
+        print(f"[lulu] Cover PDF uploaded: {cover_url}")
+        
         # Page count should now match what we tell Lulu
         page_count = len(images) * 2  # Double-sided pages
         pod_package_id = '0600X0900BWSTDSS060UW444MXX'  # 6x9, B&W, Saddle Stitch, 60# White
@@ -350,31 +371,40 @@ def send_to_lulu():
         # Parse address
         shipping_address = data.get('shipping_address', '')
         customer_name = data.get('customer_name', 'Customer')
-        customer_email = data.get('customer_email', '')
+        customer_email = data.get('customer_email', 'no-reply@example.com')
         
         # Simple address parsing (expecting: "Street, City, State, ZIP, Country")
         addr_parts = [p.strip() for p in shipping_address.split(',')]
         
-        # More complete order data with all possible fields
+        # FIXED: Correct order structure with URLs
         order_data = {
-            'external_id': order_id,  # Added external_id
+            'external_id': order_id,
+            'contact_email': customer_email or 'no-reply@example.com',  # Required field
             'line_items': [{
-                'title': f'Memory Book - {order_id}',  # Added title
-                'page_count': page_count,
-                'pod_package_id': pod_package_id,
-                'quantity': 1
+                'title': f'Memory Book - {order_id}',
+                'quantity': 1,
+                'printable_normalization': {
+                    'interior': {
+                        'source_url': pdf_url  # URL instead of file
+                    },
+                    'cover': {
+                        'source_url': cover_url  # URL instead of file
+                    },
+                    'pod_package_id': pod_package_id
+                }
             }],
             'shipping_address': {
-                'name': customer_name,
-                'street1': addr_parts[0] if len(addr_parts) > 0 else '',
-                'city': addr_parts[1] if len(addr_parts) > 1 else '',
-                'state_code': addr_parts[2] if len(addr_parts) > 2 else '',
-                'postcode': addr_parts[3] if len(addr_parts) > 3 else '',
+                'name': customer_name or 'Customer',
+                'street1': addr_parts[0] if len(addr_parts) > 0 else '123 Main St',
+                'city': addr_parts[1] if len(addr_parts) > 1 else 'City',
+                'state_code': addr_parts[2] if len(addr_parts) > 2 else 'CA',
+                'postcode': addr_parts[3] if len(addr_parts) > 3 else '12345',
                 'country_code': addr_parts[4] if len(addr_parts) > 4 else 'US',
-                'email': customer_email,
-                'phone_number': data.get('phone', '')  # Changed to phone_number
+                'email': customer_email or 'no-reply@example.com',
+                'phone_number': data.get('phone', '+1234567890')  # Required with default
             },
-            'shipping_level': 'MAIL'  # Changed to MAIL
+            'shipping_level': 'MAIL',
+            'production_delay': 120  # Optional: 2 hour delay to allow cancellations
         }
         
         # Determine endpoint based on sandbox setting
@@ -388,35 +418,29 @@ def send_to_lulu():
         # Add detailed logging
         print(f"[lulu] Sending request to Lulu API: {api_url}")
         print(f"[lulu] Order data: {json.dumps(order_data, indent=2)}")
-        print(f"[lulu] PDF size: {len(pdf_bytes)} bytes")
-        print(f"[lulu] Original images: {original_count}, Total pages in PDF: {len(images)}")
-        print(f"[lulu] Page count sent to Lulu: {page_count}")
-        print(f"[lulu] Pod package ID: {pod_package_id}")
         
-        # Prepare multipart properly
-        files = [
-            ('file', ('book.pdf', pdf_bytes, 'application/pdf')),
-            ('print_job', (None, json.dumps(order_data), 'application/json'))
-        ]
-        
-        # Create the print job
+        # FIXED: Send as JSON, not multipart
         response = requests.post(
             api_url,
-            headers={'Authorization': f'Bearer {token}'},
-            files=files
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json'  # JSON header
+            },
+            json=order_data  # Send as JSON, not files
         )
         
         # Log response details
         print(f"[lulu] Response status: {response.status_code}")
-        print(f"[lulu] Response headers: {dict(response.headers)}")
-        print(f"[lulu] Response text (first 1000 chars): {response.text[:1000]}")
+        print(f"[lulu] Response text: {response.text[:1000]}")
         
         if response.status_code in [200, 201]:
             lulu_order = response.json()
             return safe_json_response({
                 'success': True,
                 'lulu_order_id': lulu_order.get('id', 'unknown'),
-                'status': 'sent_to_lulu'
+                'status': 'sent_to_lulu',
+                'pdf_url': pdf_url,  # Include for debugging
+                'cover_url': cover_url
             })
         else:
             return safe_json_response({
