@@ -12,7 +12,7 @@ from PIL import Image
 import uuid
 import img2pdf
 
-VERSION = "cbp-v1.7-lulu"
+VERSION = "cbp-v1.8-lulu"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -303,7 +303,7 @@ def send_to_lulu():
                     img = Image.open(io.BytesIO(img_bytes))
                     if img.mode != 'RGB':
                         img = img.convert('RGB')
-                    # Resize to 6x9 at 300 DPI (changed from 8.5x11)
+                    # Resize to 6x9 at 300 DPI
                     img = img.resize((1800, 2700), Image.Resampling.LANCZOS)
                     
                     # Save to bytes
@@ -319,9 +319,9 @@ def send_to_lulu():
         # Create PDF
         pdf_bytes = img2pdf.convert(images)
         
-        # Determine product based on page count - using 6x9 format from Lulu docs
+        # Updated pod_package_id from Lulu's pricing calculator
         page_count = len(images) * 2  # Single-sided
-        pod_package_id = '0600X0900BWSTDPB060UW444MXX'  # 6x9 format that exists in Lulu's system
+        pod_package_id = '0600X0900BWSTDSS060UW444MXX'  # 6x9, B&W, Saddle Stitch, 60# White
         
         # Get Lulu token
         token = get_lulu_token()
