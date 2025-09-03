@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.14-url-validation-fix"
+VERSION = "cbp-v1.15-newline-urls"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -303,15 +303,18 @@ def send_to_lulu():
         # Get data from Zapier
         data = request.get_json(force=True, silent=True) or {}
         
-        # Parse the image URLs - FIX THE HASH IN URLS and filter out non-URLs
+        # Parse the image URLs - handle both newline and comma separated
         image_urls_str = data.get('image_urls', '')
         if isinstance(image_urls_str, list):
             image_urls = [url.replace("#", "") for url in image_urls_str if url.startswith('http')]
         else:
-            # Handle both comma and newline separators, filter for valid URLs only
-            separator = '\n' if '\n' in image_urls_str else ','
-            image_urls = [u.strip().replace("#", "") for u in image_urls_str.split(separator) 
-                         if u.strip() and u.strip().startswith('http')]
+            # Check for newlines first, then commas
+            if '\n' in image_urls_str:
+                image_urls = [u.strip().replace("#", "") for u in image_urls_str.split('\n') 
+                             if u.strip() and u.strip().startswith('http')]
+            else:
+                image_urls = [u.strip().replace("#", "") for u in image_urls_str.split(',') 
+                             if u.strip() and u.strip().startswith('http')]
         
         order_id = data.get('order_id', f"order_{int(time.time())}").replace("#", "")
         
@@ -643,7 +646,7 @@ def process_worker_internal(payload):
            
            # Read existing data to find the row
            sheet_data = service.spreadsheets().values().get(
-               spreadsheetId=spreadsheet_id,
+                spreadsheetId=spreadsheet_id,
                range='A:M'
            ).execute()
            
@@ -660,24 +663,29 @@ def process_worker_internal(payload):
                    existing_status = row[5] if len(row) > 5 else ""
                    break
            
-           # FIXED: Filter out non-URL text and errors when combining URLs
+           # Remove duplicates when combining URLs - USING NEWLINES
            successful_urls = [r for r in results if not r.startswith("ERROR") and r.startswith("http")]
            
            if existing_urls:
-               # Only keep valid URLs that start with http
-               existing_list = [u.strip() for u in existing_urls.split(',') if u.strip() and u.strip().startswith('http')]
+               # Parse existing URLs - handle both comma and newline separators
+               if '\n' in existing_urls:
+                   existing_list = [u.strip() for u in existing_urls.split('\n') if u.strip() and u.strip().startswith('http')]
+               else:
+                   existing_list = [u.strip() for u in existing_urls.split(',') if u.strip() and u.strip().startswith('http')]
+               
                seen = set(existing_list)
                for new_url in successful_urls:
                    if new_url not in seen and new_url.startswith('http'):
                        existing_list.append(new_url)
                        seen.add(new_url)
-               all_urls = ','.join(existing_list)
+               # USE NEWLINES TO PREVENT GOOGLE SHEETS CORRUPTION
+               all_urls = '\n'.join(existing_list)
            else:
-               # Filter successful URLs to only include valid URLs
-               all_urls = ','.join([u for u in successful_urls if u.startswith('http')])
+               # USE NEWLINES FOR NEW ENTRIES
+               all_urls = '\n'.join([u for u in successful_urls if u.startswith('http')])
            
            # Count total successful images
-           url_list = [u.strip() for u in all_urls.split(',') if u.strip()]
+           url_list = [u.strip() for u in all_urls.split('\n') if u.strip()]
            total_successful = len(url_list)
            
            # Update status properly for each batch
