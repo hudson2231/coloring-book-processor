@@ -8,12 +8,12 @@ import json
 from google.cloud import storage
 from google.cloud import tasks_v2
 import re
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.15-newline-urls"
+VERSION = "cbp-v1.16-error-handling"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -101,6 +101,30 @@ except Exception as e:
    storage_client = None
    bucket = None
 
+# ---------- Helper for placeholder pages ----------
+def create_placeholder_page(text="Image could not be processed"):
+   """Create a simple coloring page with text when image fails"""
+   img = Image.new('RGB', (1024, 1024), 'white')
+   draw = ImageDraw.Draw(img)
+   
+   # Draw a decorative border
+   draw.rectangle([50, 50, 974, 974], outline='black', width=3)
+   draw.rectangle([70, 70, 954, 954], outline='black', width=2)
+   
+   # Add text in center
+   text_bbox = draw.textbbox((0, 0), text)
+   text_width = text_bbox[2] - text_bbox[0]
+   text_height = text_bbox[3] - text_bbox[1]
+   x = (1024 - text_width) // 2
+   y = (1024 - text_height) // 2
+   draw.text((x, y), text, fill='black')
+   
+   # Convert to bytes
+   buffer = io.BytesIO()
+   img.save(buffer, format='PNG')
+   buffer.seek(0)
+   return buffer.getvalue()
+
 # ---------- Image helpers ----------
 def extract_direct_image_url(url: str) -> str:
    url = sanitize_text(url)
@@ -128,23 +152,40 @@ def extract_direct_image_url(url: str) -> str:
            print(f"[extract] failed to mine HTML: {safe_str(e)}")
    return url
 
+def download_image_with_retry(url: str, max_retries: int = 3) -> bytes:
+   """Download image with retry logic for network failures"""
+   for attempt in range(max_retries):
+       try:
+           direct = extract_direct_image_url(url)
+           print(f"[fetch] Attempt {attempt+1}: {direct[:120]}")
+           headers = {"User-Agent": "ColoringBookProcessor/1.0"}
+           
+           with requests.get(direct, headers=headers, timeout=REQUEST_TIMEOUT, stream=True) as r:
+               r.raise_for_status()
+               ct = (r.headers.get("content-type", "") or "").lower()
+               if "text/html" in ct:
+                   raise ValueError("Got HTML instead of image")
+               total, chunks = 0, []
+               for chunk in r.iter_content(chunk_size=8192):
+                   if chunk:
+                       total += len(chunk)
+                       if total > MAX_IMAGE_BYTES:
+                           raise ValueError("Image exceeds max size (20MB)")
+                       chunks.append(chunk)
+           return b"".join(chunks)
+       except (requests.Timeout, requests.ConnectionError) as e:
+           if attempt < max_retries - 1:
+               wait_time = (attempt + 1) * 2  # Exponential backoff
+               print(f"[fetch] Network error, retrying in {wait_time}s: {safe_str(e)}")
+               time.sleep(wait_time)
+           else:
+               raise
+       except Exception as e:
+           raise  # Non-network errors, don't retry
+
 def download_image(url: str) -> bytes:
-   direct = extract_direct_image_url(url)
-   print(f"[fetch] {direct[:120]}")
-   headers = {"User-Agent": "ColoringBookProcessor/1.0"}
-   with requests.get(direct, headers=headers, timeout=REQUEST_TIMEOUT, stream=True) as r:
-       r.raise_for_status()
-       ct = (r.headers.get("content-type", "") or "").lower()
-       if "text/html" in ct:
-           raise ValueError("Got HTML instead of image")
-       total, chunks = 0, []
-       for chunk in r.iter_content(chunk_size=8192):
-           if chunk:
-               total += len(chunk)
-               if total > MAX_IMAGE_BYTES:
-                   raise ValueError("Image exceeds max size (20MB)")
-               chunks.append(chunk)
-   return b"".join(chunks)
+   """Wrapper for backward compatibility"""
+   return download_image_with_retry(url)
 
 def _decode_image_json(j) -> bytes:
    data = j.get("data") or []
@@ -185,7 +226,8 @@ def _rest_image_edit(image_png: bytes, prompt: str) -> bytes:
    
    return _decode_image_json(resp.json())
 
-def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
+def call_openai_edit_with_retry(image_bytes: bytes, prompt: str, max_retries: int = 2) -> bytes:
+   """Call OpenAI with retry logic and fallback for safety violations"""
    img = None
    
    is_heic = (
@@ -239,14 +281,41 @@ def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
    clean_prompt = clean_prompt.encode("ascii", "ignore").decode("ascii")
    print(f"[openai] prompt: {clean_prompt[:80]}")
 
-   try:
-       return _rest_image_edit(buf.getvalue(), clean_prompt)
-   except Exception as e:
-       print(f"[openai] primary failed: {safe_str(e)}; retrying with minimal prompt")
+   for attempt in range(max_retries):
        try:
-           return _rest_image_edit(buf.getvalue(), "line art coloring page")
-       except Exception as e2:
-           raise Exception(f"Image processing failed: {safe_str(e2)}")
+           return _rest_image_edit(buf.getvalue(), clean_prompt)
+       except Exception as e:
+           error_str = str(e)
+           
+           # Check for safety violation
+           if "safety_violations" in error_str or "moderation" in error_str:
+               print(f"[openai] Safety violation detected, using placeholder")
+               return create_placeholder_page("Image filtered - draw your own design!")
+           
+           # Check for rate limit
+           elif "rate_limit" in error_str.lower():
+               wait_time = min(30, (attempt + 1) * 5)
+               print(f"[openai] Rate limit hit, waiting {wait_time}s")
+               time.sleep(wait_time)
+               continue
+           
+           # Try with minimal prompt on first failure
+           elif attempt == 0:
+               print(f"[openai] primary failed: {safe_str(e)}; retrying with minimal prompt")
+               try:
+                   return _rest_image_edit(buf.getvalue(), "line art coloring page")
+               except Exception as e2:
+                   if "safety_violations" in str(e2):
+                       return create_placeholder_page("Image filtered - draw your own design!")
+                   if attempt < max_retries - 1:
+                       continue
+                   raise Exception(f"Image processing failed: {safe_str(e2)}")
+           else:
+               raise Exception(f"Image processing failed after {attempt+1} attempts: {safe_str(e)}")
+
+def call_openai_edit(image_bytes: bytes, prompt: str) -> bytes:
+   """Wrapper for backward compatibility"""
+   return call_openai_edit_with_retry(image_bytes, prompt)
 
 # ---------- Upload helper (public URL) ----------
 def upload_to_gcs(order_id: str, idx: int, img_bytes: bytes) -> str:
@@ -299,186 +368,208 @@ def get_lulu_token():
 
 @app.route("/send-to-lulu", methods=["POST"])
 def send_to_lulu():
-    try:
-        # Get data from Zapier
-        data = request.get_json(force=True, silent=True) or {}
-        
-        # Parse the image URLs - handle both newline and comma separated
-        image_urls_str = data.get('image_urls', '')
-        if isinstance(image_urls_str, list):
-            image_urls = [url.replace("#", "") for url in image_urls_str if url.startswith('http')]
-        else:
-            # Check for newlines first, then commas
-            if '\n' in image_urls_str:
-                image_urls = [u.strip().replace("#", "") for u in image_urls_str.split('\n') 
-                             if u.strip() and u.strip().startswith('http')]
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            # Get data from Zapier
+            data = request.get_json(force=True, silent=True) or {}
+            
+            # Parse the image URLs - handle both newline and comma separated
+            image_urls_str = data.get('image_urls', '')
+            if isinstance(image_urls_str, list):
+                image_urls = [url.replace("#", "") for url in image_urls_str if url.startswith('http')]
             else:
-                image_urls = [u.strip().replace("#", "") for u in image_urls_str.split(',') 
-                             if u.strip() and u.strip().startswith('http')]
-        
-        order_id = data.get('order_id', f"order_{int(time.time())}").replace("#", "")
-        
-        # Download and prepare images
-        images = []
-        for url in image_urls:
-            if url and not url.startswith("ERROR"):
-                try:
-                    img_bytes = download_image(url)
-                    img = Image.open(io.BytesIO(img_bytes))
-                    if img.mode != 'RGB':
-                        img = img.convert('RGB')
-                    # Resize to 6x9 at 300 DPI
-                    img = img.resize((1800, 2700), Image.Resampling.LANCZOS)
+                # Check for newlines first, then commas
+                if '\n' in image_urls_str:
+                    image_urls = [u.strip().replace("#", "") for u in image_urls_str.split('\n') 
+                                 if u.strip() and u.strip().startswith('http')]
+                else:
+                    image_urls = [u.strip().replace("#", "") for u in image_urls_str.split(',') 
+                                 if u.strip() and u.strip().startswith('http')]
+            
+            order_id = data.get('order_id', f"order_{int(time.time())}").replace("#", "")
+            
+            # Download and prepare images
+            images = []
+            failed_count = 0
+            for url in image_urls:
+                if url and not url.startswith("ERROR") and not url.startswith("SKIP"):
+                    try:
+                        img_bytes = download_image(url)
+                        img = Image.open(io.BytesIO(img_bytes))
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        # Resize to 6x9 at 300 DPI
+                        img = img.resize((1800, 2700), Image.Resampling.LANCZOS)
+                        
+                        # Save to bytes
+                        img_buffer = io.BytesIO()
+                        img.save(img_buffer, format='PNG', dpi=(300, 300))
+                        images.append(img_buffer.getvalue())
+                    except Exception as e:
+                        print(f"[lulu] Failed to process image {url}: {safe_str(e)}")
+                        failed_count += 1
+            
+            if not images:
+                return safe_json_response({"success": False, "error": "No valid images to process"}, 400)
+            
+            # Add blank pages to reach minimum page count (24 pages = 12 images)
+            original_count = len(images)
+            while len(images) < 12:
+                # Create a blank white page
+                blank = Image.new('RGB', (1800, 2700), 'white')
+                blank_buffer = io.BytesIO()
+                blank.save(blank_buffer, format='PNG', dpi=(300, 300))
+                images.append(blank_buffer.getvalue())
+                print(f"[lulu] Added blank page {len(images)}/12")
+            
+            # Create PDF with ReportLab for proper formatting
+            pdf_buffer = io.BytesIO()
+            c = canvas.Canvas(pdf_buffer, pagesize=(6*72, 9*72))  # 6x9 inches at 72 points/inch
+            
+            for img_bytes in images:
+                img_reader = ImageReader(io.BytesIO(img_bytes))
+                c.drawImage(img_reader, 0, 0, width=6*72, height=9*72, preserveAspectRatio=True)
+                c.showPage()
+            
+            c.save()
+            pdf_bytes = pdf_buffer.getvalue()
+            
+            # Upload interior PDF to GCS and get URL
+            pdf_blob_name = f"lulu_pdfs/{order_id}_{int(time.time())}.pdf"
+            pdf_blob = bucket.blob(pdf_blob_name)
+            pdf_blob.upload_from_string(pdf_bytes, content_type="application/pdf")
+            pdf_url = f"https://storage.googleapis.com/{bucket.name}/{pdf_blob_name}"
+            print(f"[lulu] Interior PDF uploaded: {pdf_url}")
+            
+            # Create and upload a simple cover PDF  
+            # For saddle stitch, cover needs to be double width
+            cover_buffer = io.BytesIO()
+            cover_canvas = canvas.Canvas(cover_buffer, pagesize=(12.188*72, 9.188*72))  # Full spread for saddle stitch
+            cover_canvas.setFillColorRGB(1, 1, 1)  # White background
+            cover_canvas.rect(0, 0, 12.188*72, 9.188*72, fill=1)
+            cover_canvas.showPage()
+            cover_canvas.save()
+            
+            cover_blob_name = f"lulu_covers/{order_id}_{int(time.time())}_cover.pdf"
+            cover_blob = bucket.blob(cover_blob_name)
+            cover_blob.upload_from_string(cover_buffer.getvalue(), content_type="application/pdf")
+            cover_url = f"https://storage.googleapis.com/{bucket.name}/{cover_blob_name}"
+            print(f"[lulu] Cover PDF uploaded: {cover_url}")
+            
+            # Page count should now match what we tell Lulu
+            page_count = len(images) * 2  # Double-sided pages
+            pod_package_id = '0600X0900BWSTDSS060UW444MXX'  # 6x9, B&W, Saddle Stitch, 60# White
+            
+            # Get Lulu token
+            token = get_lulu_token()
+            
+            # Parse address
+            shipping_address = data.get('shipping_address', '')
+            customer_name = data.get('customer_name', 'Customer')
+            customer_email = data.get('customer_email', 'no-reply@example.com')
+            
+            # Simple address parsing (expecting: "Street, City, State, ZIP, Country")
+            addr_parts = [p.strip() for p in shipping_address.split(',')]
+            
+            # Correct order structure with URLs
+            order_data = {
+                'external_id': order_id,
+                'contact_email': customer_email or 'no-reply@example.com',  # Required field
+                'line_items': [{
+                    'title': f'Memory Book - {order_id}',
+                    'quantity': 1,
+                    'printable_normalization': {
+                        'interior': {
+                            'source_url': pdf_url  # URL instead of file
+                        },
+                        'cover': {
+                            'source_url': cover_url  # URL instead of file
+                        },
+                        'pod_package_id': pod_package_id
+                    }
+                }],
+                'shipping_address': {
+                    'name': customer_name or 'Customer',
+                    'street1': addr_parts[0] if len(addr_parts) > 0 else '123 Main St',
+                    'city': addr_parts[1] if len(addr_parts) > 1 else 'City',
+                    'state_code': addr_parts[2] if len(addr_parts) > 2 else 'CA',
+                    'postcode': addr_parts[3] if len(addr_parts) > 3 else '12345',
+                    'country_code': addr_parts[4] if len(addr_parts) > 4 else 'US',
+                    'email': customer_email or 'no-reply@example.com',
+                    'phone_number': data.get('phone', '+1234567890')  # Required with default
+                },
+                'shipping_level': 'MAIL',
+                'production_delay': 120  # Optional: 2 hour delay to allow cancellations
+            }
+            
+            # Determine endpoint based on sandbox setting
+            if LULU_USE_SANDBOX:
+                api_url = 'https://api.sandbox.lulu.com/print-jobs/'
+                print(f"[lulu] Using SANDBOX endpoint")
+            else:
+                api_url = 'https://api.lulu.com/print-jobs/'
+                print(f"[lulu] Using PRODUCTION endpoint")
+            
+            # Add detailed logging
+            print(f"[lulu] Sending request to Lulu API: {api_url}")
+            print(f"[lulu] Order data: {json.dumps(order_data, indent=2)}")
+            
+            # Send as JSON, not multipart
+            response = requests.post(
+                api_url,
+                headers={
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': 'application/json'  # JSON header
+                },
+                json=order_data  # Send as JSON, not files
+            )
+            
+            # Log response details
+            print(f"[lulu] Response status: {response.status_code}")
+            print(f"[lulu] Response text: {response.text[:1000]}")
+            
+            if response.status_code == 401:  # Auth failed
+                print("[lulu] Auth failed, refreshing token")
+                token = get_lulu_token()
+                continue  # Retry with new token
+                
+            if response.status_code in [200, 201]:
+                lulu_order = response.json()
+                return safe_json_response({
+                    'success': True,
+                    'lulu_order_id': lulu_order.get('id', 'unknown'),
+                    'status': 'sent_to_lulu',
+                    'pdf_url': pdf_url,  # Include for debugging
+                    'cover_url': cover_url,
+                    'failed_images': failed_count
+                })
+            elif response.status_code >= 500:  # Server error, retry
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5
+                    print(f"[lulu] Server error, retrying in {wait_time}s")
+                    time.sleep(wait_time)
+                    continue
                     
-                    # Save to bytes
-                    img_buffer = io.BytesIO()
-                    img.save(img_buffer, format='PNG', dpi=(300, 300))
-                    images.append(img_buffer.getvalue())
-                except Exception as e:
-                    print(f"[lulu] Failed to process image {url}: {safe_str(e)}")
-        
-        if not images:
-            return safe_json_response({"success": False, "error": "No valid images to process"}, 400)
-        
-        # Add blank pages to reach minimum page count (24 pages = 12 images)
-        original_count = len(images)
-        while len(images) < 12:
-            # Create a blank white page
-            blank = Image.new('RGB', (1800, 2700), 'white')
-            blank_buffer = io.BytesIO()
-            blank.save(blank_buffer, format='PNG', dpi=(300, 300))
-            images.append(blank_buffer.getvalue())
-            print(f"[lulu] Added blank page {len(images)}/12")
-        
-        # Create PDF with ReportLab for proper formatting
-        pdf_buffer = io.BytesIO()
-        c = canvas.Canvas(pdf_buffer, pagesize=(6*72, 9*72))  # 6x9 inches at 72 points/inch
-        
-        for img_bytes in images:
-            img_reader = ImageReader(io.BytesIO(img_bytes))
-            c.drawImage(img_reader, 0, 0, width=6*72, height=9*72, preserveAspectRatio=True)
-            c.showPage()
-        
-        c.save()
-        pdf_bytes = pdf_buffer.getvalue()
-        
-        # Upload interior PDF to GCS and get URL
-        pdf_blob_name = f"lulu_pdfs/{order_id}_{int(time.time())}.pdf"
-        pdf_blob = bucket.blob(pdf_blob_name)
-        pdf_blob.upload_from_string(pdf_bytes, content_type="application/pdf")
-        pdf_url = f"https://storage.googleapis.com/{bucket.name}/{pdf_blob_name}"
-        print(f"[lulu] Interior PDF uploaded: {pdf_url}")
-        
-        # Create and upload a simple cover PDF  
-        # For saddle stitch, cover needs to be double width
-        cover_buffer = io.BytesIO()
-        cover_canvas = canvas.Canvas(cover_buffer, pagesize=(12.188*72, 9.188*72))  # Full spread for saddle stitch
-        cover_canvas.setFillColorRGB(1, 1, 1)  # White background
-        cover_canvas.rect(0, 0, 12.188*72, 9.188*72, fill=1)
-        cover_canvas.showPage()
-        cover_canvas.save()
-        
-        cover_blob_name = f"lulu_covers/{order_id}_{int(time.time())}_cover.pdf"
-        cover_blob = bucket.blob(cover_blob_name)
-        cover_blob.upload_from_string(cover_buffer.getvalue(), content_type="application/pdf")
-        cover_url = f"https://storage.googleapis.com/{bucket.name}/{cover_blob_name}"
-        print(f"[lulu] Cover PDF uploaded: {cover_url}")
-        
-        # Page count should now match what we tell Lulu
-        page_count = len(images) * 2  # Double-sided pages
-        pod_package_id = '0600X0900BWSTDSS060UW444MXX'  # 6x9, B&W, Saddle Stitch, 60# White
-        
-        # Get Lulu token
-        token = get_lulu_token()
-        
-        # Parse address
-        shipping_address = data.get('shipping_address', '')
-        customer_name = data.get('customer_name', 'Customer')
-        customer_email = data.get('customer_email', 'no-reply@example.com')
-        
-        # Simple address parsing (expecting: "Street, City, State, ZIP, Country")
-        addr_parts = [p.strip() for p in shipping_address.split(',')]
-        
-        # Correct order structure with URLs
-        order_data = {
-            'external_id': order_id,
-            'contact_email': customer_email or 'no-reply@example.com',  # Required field
-            'line_items': [{
-                'title': f'Memory Book - {order_id}',
-                'quantity': 1,
-                'printable_normalization': {
-                    'interior': {
-                        'source_url': pdf_url  # URL instead of file
-                    },
-                    'cover': {
-                        'source_url': cover_url  # URL instead of file
-                    },
-                    'pod_package_id': pod_package_id
-                }
-            }],
-            'shipping_address': {
-                'name': customer_name or 'Customer',
-                'street1': addr_parts[0] if len(addr_parts) > 0 else '123 Main St',
-                'city': addr_parts[1] if len(addr_parts) > 1 else 'City',
-                'state_code': addr_parts[2] if len(addr_parts) > 2 else 'CA',
-                'postcode': addr_parts[3] if len(addr_parts) > 3 else '12345',
-                'country_code': addr_parts[4] if len(addr_parts) > 4 else 'US',
-                'email': customer_email or 'no-reply@example.com',
-                'phone_number': data.get('phone', '+1234567890')  # Required with default
-            },
-            'shipping_level': 'MAIL',
-            'production_delay': 120  # Optional: 2 hour delay to allow cancellations
-        }
-        
-        # Determine endpoint based on sandbox setting
-        if LULU_USE_SANDBOX:
-            api_url = 'https://api.sandbox.lulu.com/print-jobs/'
-            print(f"[lulu] Using SANDBOX endpoint")
-        else:
-            api_url = 'https://api.lulu.com/print-jobs/'
-            print(f"[lulu] Using PRODUCTION endpoint")
-        
-        # Add detailed logging
-        print(f"[lulu] Sending request to Lulu API: {api_url}")
-        print(f"[lulu] Order data: {json.dumps(order_data, indent=2)}")
-        
-        # Send as JSON, not multipart
-        response = requests.post(
-            api_url,
-            headers={
-                'Authorization': f'Bearer {token}',
-                'Content-Type': 'application/json'  # JSON header
-            },
-            json=order_data  # Send as JSON, not files
-        )
-        
-        # Log response details
-        print(f"[lulu] Response status: {response.status_code}")
-        print(f"[lulu] Response text: {response.text[:1000]}")
-        
-        if response.status_code in [200, 201]:
-            lulu_order = response.json()
-            return safe_json_response({
-                'success': True,
-                'lulu_order_id': lulu_order.get('id', 'unknown'),
-                'status': 'sent_to_lulu',
-                'pdf_url': pdf_url,  # Include for debugging
-                'cover_url': cover_url
-            })
-        else:
             return safe_json_response({
                 'success': False,
                 'error': f"Lulu API error: {response.text}"
             }, 500)
-            
-    except Exception as e:
-        print(f"[lulu] Error: {safe_str(e)}")
-        import traceback
-        print(f"[lulu] Traceback: {traceback.format_exc()}")
-        return safe_json_response({
-            'success': False,
-            'error': safe_str(e)
-        }, 500)
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 3
+                print(f"[lulu] Error on attempt {attempt+1}, retrying in {wait_time}s: {safe_str(e)}")
+                time.sleep(wait_time)
+            else:
+                print(f"[lulu] Failed after {max_retries} attempts: {safe_str(e)}")
+                import traceback
+                print(f"[lulu] Traceback: {traceback.format_exc()}")
+                return safe_json_response({
+                    'success': False,
+                    'error': safe_str(e)
+                }, 500)
 
 # ---------- Routes ----------
 @app.route("/process", methods=["POST"])
@@ -600,6 +691,7 @@ def process_worker_internal(payload):
        total_batches = payload.get("total_batches", 1)
        batch_start_index = payload.get("batch_start_index", 0)
        total_images = payload.get("total_images", len(image_urls))
+       retry_count = payload.get("retry_count", 0)
        
        print(f"[worker] Processing batch {batch_number}/{total_batches} for order {order_id}: {len(image_urls)} images")
        
@@ -627,6 +719,8 @@ def process_worker_internal(payload):
                print(f"[worker] Could not check existing status: {safe_str(e)}")
        
        results = []
+       error_count = 0
+       
        for idx, url in enumerate(image_urls):
            try:
                actual_idx = batch_start_index + idx
@@ -636,8 +730,18 @@ def process_worker_internal(payload):
                final_url = upload_to_gcs(order_id, actual_idx, edited)
                results.append(final_url)
            except Exception as e:
+               error_str = str(e)
                print(f"[worker] Error processing image {idx}: {safe_str(e)}")
-               results.append(f"ERROR: {safe_str(e)}")
+               
+               # Check if it's a safety violation - use placeholder
+               if "safety" in error_str.lower() or "filtered" in error_str.lower():
+                   placeholder = create_placeholder_page(f"Image {actual_idx+1} - Create your own!")
+                   final_url = upload_to_gcs(order_id, actual_idx, placeholder)
+                   results.append(final_url)
+                   print(f"[worker] Used placeholder for filtered image {idx}")
+               else:
+                   results.append(f"SKIPPED: Image {actual_idx+1} failed")
+                   error_count += 1
        
        # Update Google Sheets - either update existing row or create new
        try:
@@ -647,13 +751,14 @@ def process_worker_internal(payload):
            # Read existing data to find the row
            sheet_data = service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-               range='A:M'
+               range='A:P'  # Extended to include new columns
            ).execute()
            
            values = sheet_data.get('values', [])
            row_index = None
            existing_urls = ""
            existing_status = ""
+           existing_error_count = 0
            
            # Find existing row for this order
            for i, row in enumerate(values):
@@ -661,10 +766,14 @@ def process_worker_internal(payload):
                    row_index = i + 1
                    existing_urls = row[4] if len(row) > 4 else ""
                    existing_status = row[5] if len(row) > 5 else ""
+                   existing_error_count = int(row[14]) if len(row) > 14 and row[14].isdigit() else 0
                    break
            
+           # Combine error counts
+           total_error_count = existing_error_count + error_count
+           
            # Remove duplicates when combining URLs - USING NEWLINES
-           successful_urls = [r for r in results if not r.startswith("ERROR") and r.startswith("http")]
+           successful_urls = [r for r in results if not r.startswith("ERROR") and not r.startswith("SKIP") and r.startswith("http")]
            
            if existing_urls:
                # Parse existing URLs - handle both comma and newline separators
@@ -684,14 +793,20 @@ def process_worker_internal(payload):
                # USE NEWLINES FOR NEW ENTRIES
                all_urls = '\n'.join([u for u in successful_urls if u.startswith('http')])
            
+           # Create comma-separated version for Zapier
+           zapier_urls = all_urls.replace('\n', ',')
+           
            # Count total successful images
            url_list = [u.strip() for u in all_urls.split('\n') if u.strip()]
            total_successful = len(url_list)
            
            # Update status properly for each batch
            if batch_number == total_batches:
-               status = 'complete'
-               notes = f'All {total_batches} batch(es) processed. {total_successful}/{total_images} images successful.'
+               if total_successful >= total_images * 0.75:  # At least 75% success
+                   status = 'complete'
+               else:
+                   status = 'partial_complete'
+               notes = f'All {total_batches} batch(es) processed. {total_successful}/{total_images} images successful, {total_error_count} errors.'
            else:
                expected_status = f'processing_batch_{batch_number}/{total_batches}'
                if existing_status and 'processing_batch_' in existing_status:
@@ -712,26 +827,29 @@ def process_worker_internal(payload):
            
            # Prepare row data with POD columns
            row_data = [
-               order_id,                          # A
-               payload.get('customer_name', 'N/A'),  # B
-               payload.get('customer_email', 'N/A'), # C
-               payload.get('shipping_address', 'N/A'), # D
-               all_urls,                          # E
-               status,                            # F
-               time.strftime('%Y-%m-%d %H:%M:%S'), # G
-               total_successful,                  # H
-               payload.get('shopify_order_number', order_id), # I
-               notes,                             # J
+               order_id,                          # A - Order ID
+               payload.get('customer_name', 'N/A'),  # B - Customer Name
+               payload.get('customer_email', 'N/A'), # C - Customer Email
+               payload.get('shipping_address', 'N/A'), # D - Shipping Address
+               all_urls,                          # E - Image URLs
+               status,                            # F - Status
+               time.strftime('%Y-%m-%d %H:%M:%S'), # G - Timestamp
+               total_successful,                  # H - Number of Images
+               payload.get('shopify_order_number', order_id), # I - Shopify Order Number
+               notes,                             # J - Notes
                'FALSE',                           # K - Send to POD
                '',                                # L - Lulu Order ID
-               ''                                 # M - POD Date
+               '',                                # M - POD Date
+               zapier_urls,                       # N - Zapier URLs (comma-separated)
+               str(total_error_count),            # O - Error Count
+               str(retry_count)                   # P - Retry Count
            ]
            
            if row_index:
                print(f"[worker] Updating row {row_index} for order {order_id} - Status: {status}")
                service.spreadsheets().values().update(
                    spreadsheetId=spreadsheet_id,
-                   range=f'A{row_index}:M{row_index}',
+                   range=f'A{row_index}:P{row_index}',
                    valueInputOption='RAW',
                    body={'values': [row_data]}
                ).execute()
@@ -739,17 +857,30 @@ def process_worker_internal(payload):
                print(f"[worker] Creating new row for order {order_id} - Status: {status}")
                service.spreadsheets().values().append(
                    spreadsheetId=spreadsheet_id,
-                   range='A:M',
+                   range='A:P',
                    valueInputOption='RAW',
                    body={'values': [row_data]}
                ).execute()
            
-           print(f"[worker] Batch {batch_number}/{total_batches} for order {order_id} complete. {len(successful_urls)} new images added.")
+           print(f"[worker] Batch {batch_number}/{total_batches} for order {order_id} complete. {len(successful_urls)} images processed, {error_count} errors.")
            
        except Exception as e:
            print(f"[worker] Failed to write to sheets: {safe_str(e)}")
+           # Store backup locally if Sheets fails
+           try:
+               backup_data = {
+                   "order_id": order_id,
+                   "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+                   "results": results,
+                   "error": str(e)
+               }
+               with open(f"/tmp/backup_{order_id}_{batch_number}.json", "w") as f:
+                   json.dump(backup_data, f)
+               print(f"[worker] Backup saved to /tmp/backup_{order_id}_{batch_number}.json")
+           except:
+               pass
        
-       return safe_json_response({"success": True, "batch": batch_number, "results": results})
+       return safe_json_response({"success": True, "batch": batch_number, "results": results, "errors": error_count})
        
    except Exception as e:
        print(f"[worker] Job failed: {safe_str(e)}")
