@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.17-with-originals"
+VERSION = "cbp-v1.18-fixed-customer-data"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -591,15 +591,26 @@ def process():
            payload['image_urls'] = image_urls
            payload['prompt'] = request.form.get('prompt', DEFAULT_PROMPT)
            
-           # EXTRACT CUSTOMER DATA FROM FORM
-           payload['customer_name'] = request.form.get('customer_name', 'N/A')
+           # EXTRACT CUSTOMER DATA FROM FORM - FIX NAME SPACING
+           raw_name = request.form.get('customer_name', 'N/A')
+           # Add space between concatenated first/last names if missing
+           if raw_name != 'N/A' and not ' ' in raw_name:
+               # Try to split camelCase or detect where first name ends
+               import re
+               # Check for camelCase pattern (lowercase followed by uppercase)
+               pattern = re.search(r'([a-z])([A-Z])', raw_name)
+               if pattern:
+                   raw_name = raw_name[:pattern.start()+1] + ' ' + raw_name[pattern.start()+1:]
+           payload['customer_name'] = raw_name
            payload['customer_email'] = request.form.get('customer_email', 'N/A')
            payload['shipping_address'] = request.form.get('shipping_address', 'N/A')
+           
+           print(f"[process] Fixed customer_name: {payload['customer_name']}")
+           print(f"[process] shipping_address: {payload['shipping_address']}")
        
        image_urls = payload.get('image_urls', [])
        order_id = payload.get('order_id')
        print(f"[process] order_id={order_id}, total urls={len(image_urls)}")
-       print(f"[process] customer_name={payload.get('customer_name')}, customer_email={payload.get('customer_email')}")
        
        # Store original URLs for the spreadsheet
        payload['original_urls'] = image_urls.copy()
