@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.19-fixed-accuracy"
+VERSION = "cbp-v1.20-optimized-prompt"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -69,19 +69,16 @@ def get_api_key() -> str:
 
 # ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
-# IMPROVED PROMPT TO PREVENT HALLUCINATIONS
+# REFINED PROMPT FOR BETTER ACCURACY
 DEFAULT_PROMPT = (
-   "Convert this photograph to a line art coloring page. "
-   "CRITICAL RULES: "
-   "1. DO NOT add ANY people, objects, or elements that don't exist in the original photo "
-   "2. DO NOT change indoor scenes to outdoor or vice versa "
-   "3. DO NOT add backgrounds, patterns, or decorations not present in the original "
-   "4. EXACTLY preserve the number of people - do not add or remove anyone "
-   "5. MAINTAIN the exact setting - if outdoors keep outdoors, if indoors keep indoors "
-   "6. PRESERVE all existing elements exactly where they appear "
-   "7. If the background is simple or blurred, keep it simple - do not add detail "
-   "8. Convert ONLY what you see to clean black outlines on white background "
-   "Create clean black outlines suitable for coloring, 3-4 pixel width, but NEVER invent or imagine content not in the photo."
+   "Create a detailed line art coloring book version of this photo. "
+   "Trace exactly what exists - every person, every face, every object, every background element. "
+   "Black outlines only, 3-4 pixel thickness, white background. "
+   "Maintain photographic accuracy: same number of people, same positions, same expressions. "
+   "Background faces must have distinguishable features, not simplified. "
+   "Environmental details (walls, furniture, architecture) must match the photo exactly. "
+   "This is a technical line conversion, not artistic interpretation. "
+   "Do not add, remove, or reimagine any elements."
 )
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 REQUEST_TIMEOUT = 30
