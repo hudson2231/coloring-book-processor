@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.18-fixed-customer-data"
+VERSION = "cbp-v1.19-fixed-accuracy"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -69,18 +69,19 @@ def get_api_key() -> str:
 
 # ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
+# IMPROVED PROMPT TO PREVENT HALLUCINATIONS
 DEFAULT_PROMPT = (
-   "Transform this photograph into a professional adult coloring book illustration with these MANDATORY requirements: "
-   "PRESERVE EVERY VISIBLE ELEMENT - people, faces, hair, clothing, jewelry, furniture, walls, ceiling, floors, windows, doors, signs, decorations, food, drinks, plants, vehicles, and ALL background objects. "
-   "CONVERT photographic shadows, lighting, and dark areas into clear structural LINE ART ELEMENTS - NOT empty white space. "
-   "CREATE bold consistent black OUTLINES ONLY (3-4 pixel width) throughout the ENTIRE image on pure white background. "
-   "NO SHADING, NO CROSSHATCHING, NO DIAGONAL LINES, NO FILL PATTERNS - only clean black outlines on white. "
-   "MAINTAIN exact facial expressions, eye shapes, smiles, and proportions with precise detail. "
-   "RENDER background architecture as detailed line drawings - include ceiling details, wall textures, window frames, architectural elements. "
-   "TRANSFORM all people in background into clear line art figures - do not eliminate them. "
-   "CONVERT all objects, furniture, and environmental elements into detailed colorable line art sections with OUTLINES ONLY. "
-   "ENSURE every area has clear, closed black outlines with NO INTERIOR SHADING - perfect for coloring with markers. "
-   "GENERATE publication-quality adult coloring book page with maximum environmental context and rich detail throughout entire scene using OUTLINES ONLY."
+   "Convert this photograph to a line art coloring page. "
+   "CRITICAL RULES: "
+   "1. DO NOT add ANY people, objects, or elements that don't exist in the original photo "
+   "2. DO NOT change indoor scenes to outdoor or vice versa "
+   "3. DO NOT add backgrounds, patterns, or decorations not present in the original "
+   "4. EXACTLY preserve the number of people - do not add or remove anyone "
+   "5. MAINTAIN the exact setting - if outdoors keep outdoors, if indoors keep indoors "
+   "6. PRESERVE all existing elements exactly where they appear "
+   "7. If the background is simple or blurred, keep it simple - do not add detail "
+   "8. Convert ONLY what you see to clean black outlines on white background "
+   "Create clean black outlines suitable for coloring, 3-4 pixel width, but NEVER invent or imagine content not in the photo."
 )
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 REQUEST_TIMEOUT = 30
@@ -591,22 +592,14 @@ def process():
            payload['image_urls'] = image_urls
            payload['prompt'] = request.form.get('prompt', DEFAULT_PROMPT)
            
-           # EXTRACT CUSTOMER DATA FROM FORM - FIX NAME SPACING
-           raw_name = request.form.get('customer_name', 'N/A')
-           # Add space between concatenated first/last names if missing
-           if raw_name != 'N/A' and not ' ' in raw_name:
-               # Try to split camelCase or detect where first name ends
-               import re
-               # Check for camelCase pattern (lowercase followed by uppercase)
-               pattern = re.search(r'([a-z])([A-Z])', raw_name)
-               if pattern:
-                   raw_name = raw_name[:pattern.start()+1] + ' ' + raw_name[pattern.start()+1:]
-           payload['customer_name'] = raw_name
+           # EXTRACT CUSTOMER DATA FROM FORM
+           payload['customer_name'] = request.form.get('customer_name', 'N/A')
            payload['customer_email'] = request.form.get('customer_email', 'N/A')
            payload['shipping_address'] = request.form.get('shipping_address', 'N/A')
            
-           print(f"[process] Fixed customer_name: {payload['customer_name']}")
-           print(f"[process] shipping_address: {payload['shipping_address']}")
+           print(f"[process] Received customer_name: {payload['customer_name']}")
+           print(f"[process] Received customer_email: {payload['customer_email']}")
+           print(f"[process] Received shipping_address: {payload['shipping_address']}")
        
        image_urls = payload.get('image_urls', [])
        order_id = payload.get('order_id')
@@ -715,6 +708,7 @@ def process_worker_internal(payload):
        retry_count = payload.get("retry_count", 0)
        
        print(f"[worker] Processing batch {batch_number}/{total_batches} for order {order_id}: {len(image_urls)} images")
+       print(f"[worker] Customer data - name: {payload.get('customer_name')}, email: {payload.get('customer_email')}")
        
        # NEW SPREADSHEET ID
        spreadsheet_id = '1fVKN0Lf6FHnfFvNZW80nNuxn_Vx3HHHR0cbwcfj5gwc'
