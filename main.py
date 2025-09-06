@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.16-error-handling"
+VERSION = "cbp-v1.17-with-originals"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -590,10 +590,19 @@ def process():
                image_urls = request.form.getlist('image_url')
            payload['image_urls'] = image_urls
            payload['prompt'] = request.form.get('prompt', DEFAULT_PROMPT)
+           
+           # EXTRACT CUSTOMER DATA FROM FORM
+           payload['customer_name'] = request.form.get('customer_name', 'N/A')
+           payload['customer_email'] = request.form.get('customer_email', 'N/A')
+           payload['shipping_address'] = request.form.get('shipping_address', 'N/A')
        
        image_urls = payload.get('image_urls', [])
        order_id = payload.get('order_id')
        print(f"[process] order_id={order_id}, total urls={len(image_urls)}")
+       print(f"[process] customer_name={payload.get('customer_name')}, customer_email={payload.get('customer_email')}")
+       
+       # Store original URLs for the spreadsheet
+       payload['original_urls'] = image_urls.copy()
        
        # Split into batches
        total_batches = (len(image_urls) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -686,6 +695,7 @@ def process_worker_internal(payload):
    try:
        order_id = payload.get("order_id", f"order_{int(time.time())}")
        image_urls = payload.get("image_urls", [])
+       original_urls = payload.get("original_urls", [])
        prompt = payload.get("prompt", DEFAULT_PROMPT)
        batch_number = payload.get("batch_number", 1)
        total_batches = payload.get("total_batches", 1)
@@ -751,7 +761,7 @@ def process_worker_internal(payload):
            # Read existing data to find the row
            sheet_data = service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id,
-               range='A:P'  # Extended to include new columns
+               range='A:Q'  # Extended to include column Q for original URLs
            ).execute()
            
            values = sheet_data.get('values', [])
@@ -796,6 +806,14 @@ def process_worker_internal(payload):
            # Create comma-separated version for Zapier
            zapier_urls = all_urls.replace('\n', ',')
            
+           # Format original URLs with newlines for column Q
+           if batch_number == 1 and original_urls:
+               # Only set original URLs on first batch
+               original_urls_str = '\n'.join(original_urls)
+           else:
+               # Keep existing original URLs for subsequent batches
+               original_urls_str = ''
+           
            # Count total successful images
            url_list = [u.strip() for u in all_urls.split('\n') if u.strip()]
            total_successful = len(url_list)
@@ -825,13 +843,13 @@ def process_worker_internal(payload):
                    status = expected_status
                    notes = f'Batch {batch_number}/{total_batches} complete. Processing continues...'
            
-           # Prepare row data with POD columns
+           # Prepare row data with POD columns and original URLs
            row_data = [
                order_id,                          # A - Order ID
                payload.get('customer_name', 'N/A'),  # B - Customer Name
                payload.get('customer_email', 'N/A'), # C - Customer Email
                payload.get('shipping_address', 'N/A'), # D - Shipping Address
-               all_urls,                          # E - Image URLs
+               all_urls,                          # E - Image URLs (processed)
                status,                            # F - Status
                time.strftime('%Y-%m-%d %H:%M:%S'), # G - Timestamp
                total_successful,                  # H - Number of Images
@@ -842,14 +860,22 @@ def process_worker_internal(payload):
                '',                                # M - POD Date
                zapier_urls,                       # N - Zapier URLs (comma-separated)
                str(total_error_count),            # O - Error Count
-               str(retry_count)                   # P - Retry Count
+               str(retry_count),                  # P - Retry Count
+               original_urls_str if batch_number == 1 else ''  # Q - Original URLs (only on first batch)
            ]
            
            if row_index:
                print(f"[worker] Updating row {row_index} for order {order_id} - Status: {status}")
+               # Don't overwrite column Q if it already has data
+               if batch_number != 1:
+                   # Read existing column Q value
+                   existing_row = values[row_index - 1] if row_index <= len(values) else []
+                   if len(existing_row) > 16:  # Column Q is index 16
+                       row_data[16] = existing_row[16]  # Keep existing original URLs
+               
                service.spreadsheets().values().update(
                    spreadsheetId=spreadsheet_id,
-                   range=f'A{row_index}:P{row_index}',
+                   range=f'A{row_index}:Q{row_index}',
                    valueInputOption='RAW',
                    body={'values': [row_data]}
                ).execute()
@@ -857,7 +883,7 @@ def process_worker_internal(payload):
                print(f"[worker] Creating new row for order {order_id} - Status: {status}")
                service.spreadsheets().values().append(
                    spreadsheetId=spreadsheet_id,
-                   range='A:P',
+                   range='A:Q',
                    valueInputOption='RAW',
                    body={'values': [row_data]}
                ).execute()
