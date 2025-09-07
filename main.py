@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.21-precise-counting"
+VERSION = "cbp-v1.22-enhanced-faces"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -69,10 +69,11 @@ def get_api_key() -> str:
 
 # ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
-# REFINED PROMPT WITH EXPLICIT COUNTING AND COMPOSITION RULES
+# ENHANCED PROMPT WITH FACE RECOGNITION EMPHASIS
 DEFAULT_PROMPT = (
    "Transform this photograph into a professional adult coloring book illustration with these MANDATORY requirements: "
    "CRITICAL COUNTING RULE: Count every person in the photo first. If photo shows 1 person, output must show 1 person. If photo shows 2 people, output must show exactly 2 people. Never add extra people or figures. "
+   "FACE RECOGNITION RULE: Each face must remain recognizable. Preserve unique features through line placement - do not use generic cartoon faces. "
    "PRESERVE EVERY VISIBLE ELEMENT - maintain exact positions of people, faces, hair, clothing, furniture, and background objects as they appear in the photo. "
    "ENVIRONMENT RULE: Outdoor scenes with grass, fences, and sky must remain outdoor. Indoor scenes must remain indoor. Simple backgrounds must stay simple - empty grass is empty grass, not a crowd. "
    "CREATE bold consistent black OUTLINES ONLY (3-4 pixel width) throughout the ENTIRE image on pure white background. "
@@ -80,7 +81,7 @@ DEFAULT_PROMPT = (
    "MAINTAIN exact facial expressions, eye shapes, smiles, and proportions with precise detail for ALL visible faces. "
    "BACKGROUND PRECISION: If background is simple (grass, fence, sky), keep it simple with minimal lines. Do not add complexity where none exists. "
    "FORBIDDEN ADDITIONS: Do NOT add people in background, do NOT add furniture not present, do NOT add architectural elements not in photo. "
-   "TECHNICAL EXECUTION: This is precise line extraction from the existing photo, not artistic reinterpretation. "
+   "TECHNICAL EXECUTION: This is photographic line tracing, not artistic interpretation. Extract edges exactly as they appear. "
    "FINAL CHECK: Output must have same number of people, same setting (indoor/outdoor), and same objects as input photograph."
 )
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
