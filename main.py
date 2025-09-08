@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.22-enhanced-faces"
+VERSION = "cbp-v1.23-balanced-backgrounds"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -69,7 +69,7 @@ def get_api_key() -> str:
 
 # ---------- Config ----------
 bucket_name = os.environ.get("OUTPUT_BUCKET", "memory-books-output")
-# ENHANCED PROMPT WITH FACE RECOGNITION EMPHASIS
+# BALANCED PROMPT - PERFECT FACES WITH PROPER BACKGROUNDS
 DEFAULT_PROMPT = (
    "Transform this photograph into a professional adult coloring book illustration with these MANDATORY requirements: "
    "CRITICAL COUNTING RULE: Count every person in the photo first. If photo shows 1 person, output must show 1 person. If photo shows 2 people, output must show exactly 2 people. Never add extra people or figures. "
@@ -79,7 +79,7 @@ DEFAULT_PROMPT = (
    "CREATE bold consistent black OUTLINES ONLY (3-4 pixel width) throughout the ENTIRE image on pure white background. "
    "NO SHADING, NO CROSSHATCHING, NO DIAGONAL LINES, NO FILL PATTERNS - only clean black outlines on white. "
    "MAINTAIN exact facial expressions, eye shapes, smiles, and proportions with precise detail for ALL visible faces. "
-   "BACKGROUND PRECISION: If background is simple (grass, fence, sky), keep it simple with minimal lines. Do not add complexity where none exists. "
+   "BACKGROUND PRECISION: Include background elements that exist in the photo using simple line work. Grass = horizon line and texture hints. Sky = cloud outlines or boundary. Walls = edge lines. Fences = vertical lines. Do not leave backgrounds empty, but do not add elements not in the original photo. "
    "FORBIDDEN ADDITIONS: Do NOT add people in background, do NOT add furniture not present, do NOT add architectural elements not in photo. "
    "TECHNICAL EXECUTION: This is photographic line tracing, not artistic interpretation. Extract edges exactly as they appear. "
    "FINAL CHECK: Output must have same number of people, same setting (indoor/outdoor), and same objects as input photograph."
