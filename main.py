@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.23-balanced-backgrounds"
+VERSION = "cbp-v1.25-custom-cover"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -445,20 +445,9 @@ def send_to_lulu():
             pdf_url = f"https://storage.googleapis.com/{bucket.name}/{pdf_blob_name}"
             print(f"[lulu] Interior PDF uploaded: {pdf_url}")
             
-            # Create and upload a simple cover PDF  
-            # For saddle stitch, cover needs to be double width
-            cover_buffer = io.BytesIO()
-            cover_canvas = canvas.Canvas(cover_buffer, pagesize=(12.188*72, 9.188*72))  # Full spread for saddle stitch
-            cover_canvas.setFillColorRGB(1, 1, 1)  # White background
-            cover_canvas.rect(0, 0, 12.188*72, 9.188*72, fill=1)
-            cover_canvas.showPage()
-            cover_canvas.save()
-            
-            cover_blob_name = f"lulu_covers/{order_id}_{int(time.time())}_cover.pdf"
-            cover_blob = bucket.blob(cover_blob_name)
-            cover_blob.upload_from_string(cover_buffer.getvalue(), content_type="application/pdf")
-            cover_url = f"https://storage.googleapis.com/{bucket.name}/{cover_blob_name}"
-            print(f"[lulu] Cover PDF uploaded: {cover_url}")
+            # USE STATIC COVER URL INSTEAD OF GENERATING
+            cover_url = "https://storage.googleapis.com/memory-books-output/covers/standard_cover.pdf"
+            print(f"[lulu] Using static cover: {cover_url}")
             
             # Page count should now match what we tell Lulu
             page_count = len(images) * 2  # Double-sided pages
