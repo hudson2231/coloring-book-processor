@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.26-address-fix"
+VERSION = "cbp-v1.27-country-fix"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -456,7 +456,7 @@ def send_to_lulu():
             # Get Lulu token
             token = get_lulu_token()
             
-            # Parse address with better handling
+            # Parse address - SIMPLIFIED SINCE WE NOW GET 2-LETTER CODES
             shipping_address = data.get('shipping_address', '')
             customer_name = data.get('customer_name', 'Customer')
             customer_email = data.get('customer_email', 'no-reply@example.com')
@@ -466,51 +466,24 @@ def send_to_lulu():
             print(f"[lulu] Raw customer name: {customer_name}")
             print(f"[lulu] Raw customer email: {customer_email}")
             
-            # Simple address parsing (expecting: "Street, City, State, ZIP, Country")
+            # Parse address (expecting: "Street, City, State_Code, ZIP, Country_Code")
             addr_parts = [p.strip() for p in shipping_address.split(',')]
             print(f"[lulu] Parsed address parts: {addr_parts}")
             
-            # Convert country names to ISO codes
-            country_part = addr_parts[4].strip().upper() if len(addr_parts) > 4 else 'US'
-            if 'UNITED STATES' in country_part or 'USA' in country_part or 'U.S.A' in country_part or 'U.S.' in country_part:
+            # Ensure we have enough parts
+            while len(addr_parts) < 5:
+                addr_parts.append('')
+            
+            # Get country code - it's already a 2-letter code from Shopify
+            country_code = addr_parts[4].strip().upper() if addr_parts[4] else 'US'
+            
+            # Validate it's 2 characters
+            if len(country_code) != 2:
+                print(f"[lulu] WARNING: Invalid country code '{country_code}', defaulting to US")
                 country_code = 'US'
-            elif 'CANADA' in country_part:
-                country_code = 'CA'
-            elif 'UNITED KINGDOM' in country_part or 'UK' in country_part or 'U.K.' in country_part:
-                country_code = 'GB'
-            elif 'AUSTRALIA' in country_part:
-                country_code = 'AU'
-            elif len(country_part) == 2:
-                country_code = country_part
-            else:
-                country_code = 'US'  # Default to US
             
-            # Convert state names to codes (for US addresses)
-            state_part = addr_parts[2].strip().upper() if len(addr_parts) > 2 else 'CA'
-            
-            # Common US state conversions
-            US_STATES = {
-                'ALABAMA': 'AL', 'ALASKA': 'AK', 'ARIZONA': 'AZ', 'ARKANSAS': 'AR',
-                'CALIFORNIA': 'CA', 'COLORADO': 'CO', 'CONNECTICUT': 'CT', 'DELAWARE': 'DE',
-                'FLORIDA': 'FL', 'GEORGIA': 'GA', 'HAWAII': 'HI', 'IDAHO': 'ID',
-                'ILLINOIS': 'IL', 'INDIANA': 'IN', 'IOWA': 'IA', 'KANSAS': 'KS',
-                'KENTUCKY': 'KY', 'LOUISIANA': 'LA', 'MAINE': 'ME', 'MARYLAND': 'MD',
-                'MASSACHUSETTS': 'MA', 'MICHIGAN': 'MI', 'MINNESOTA': 'MN', 'MISSISSIPPI': 'MS',
-                'MISSOURI': 'MO', 'MONTANA': 'MT', 'NEBRASKA': 'NE', 'NEVADA': 'NV',
-                'NEW HAMPSHIRE': 'NH', 'NEW JERSEY': 'NJ', 'NEW MEXICO': 'NM', 'NEW YORK': 'NY',
-                'NORTH CAROLINA': 'NC', 'NORTH DAKOTA': 'ND', 'OHIO': 'OH', 'OKLAHOMA': 'OK',
-                'OREGON': 'OR', 'PENNSYLVANIA': 'PA', 'RHODE ISLAND': 'RI', 'SOUTH CAROLINA': 'SC',
-                'SOUTH DAKOTA': 'SD', 'TENNESSEE': 'TN', 'TEXAS': 'TX', 'UTAH': 'UT',
-                'VERMONT': 'VT', 'VIRGINIA': 'VA', 'WASHINGTON': 'WA', 'WEST VIRGINIA': 'WV',
-                'WISCONSIN': 'WI', 'WYOMING': 'WY'
-            }
-            
-            if state_part in US_STATES:
-                state_code = US_STATES[state_part]
-            elif len(state_part) == 2:
-                state_code = state_part
-            else:
-                state_code = 'CA'  # Default to California
+            # State code is already correct from Shopify
+            state_code = addr_parts[2].strip().upper() if addr_parts[2] else 'CA'
             
             print(f"[lulu] Final country code: {country_code}")
             print(f"[lulu] Final state code: {state_code}")
@@ -534,11 +507,11 @@ def send_to_lulu():
                 }],
                 'shipping_address': {
                     'name': customer_name or 'Customer',
-                    'street1': addr_parts[0] if len(addr_parts) > 0 else '123 Main St',
-                    'city': addr_parts[1] if len(addr_parts) > 1 else 'City',
-                    'state_code': state_code,  # Use converted state code
-                    'postcode': addr_parts[3] if len(addr_parts) > 3 else '12345',
-                    'country_code': country_code,  # Use converted country code
+                    'street1': addr_parts[0] if addr_parts[0] else '123 Main St',
+                    'city': addr_parts[1] if addr_parts[1] else 'City',
+                    'state_code': state_code,
+                    'postcode': addr_parts[3] if addr_parts[3] else '12345',
+                    'country_code': country_code,
                     'email': customer_email or 'no-reply@example.com',
                     'phone_number': data.get('phone', '+1234567890')  # Required with default
                 },
