@@ -13,7 +13,7 @@ import uuid
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-VERSION = "cbp-v1.27-country-fix"
+VERSION = "cbp-v1.28-smart-address"
 
 # --- Nuke any proxy env that could interfere ---
 for _k in ("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy",
@@ -456,7 +456,7 @@ def send_to_lulu():
             # Get Lulu token
             token = get_lulu_token()
             
-            # Parse address - SIMPLIFIED SINCE WE NOW GET 2-LETTER CODES
+            # Parse address with smart handling
             shipping_address = data.get('shipping_address', '')
             customer_name = data.get('customer_name', 'Customer')
             customer_email = data.get('customer_email', 'no-reply@example.com')
@@ -466,27 +466,61 @@ def send_to_lulu():
             print(f"[lulu] Raw customer name: {customer_name}")
             print(f"[lulu] Raw customer email: {customer_email}")
             
-            # Parse address (expecting: "Street, City, State_Code, ZIP, Country_Code")
+            # Smart address parsing that handles different formats
             addr_parts = [p.strip() for p in shipping_address.split(',')]
-            print(f"[lulu] Parsed address parts: {addr_parts}")
+            print(f"[lulu] Raw parsed address parts ({len(addr_parts)} parts): {addr_parts}")
             
-            # Ensure we have enough parts
-            while len(addr_parts) < 5:
-                addr_parts.append('')
+            # Handle different address formats based on number of parts
+            if len(addr_parts) == 4:
+                # Format: "Street, City State, Postcode, Country" (missing comma after state)
+                # Split the second part by space to extract state
+                if ' ' in addr_parts[1]:
+                    city_state = addr_parts[1].rsplit(' ', 1)  # Split from right to get last word as state
+                    street = addr_parts[0]
+                    city = city_state[0]
+                    state = city_state[1]
+                    postcode = addr_parts[2]
+                    country = addr_parts[3]
+                else:
+                    # No state in address (some countries don't use states)
+                    street = addr_parts[0]
+                    city = addr_parts[1]
+                    state = ''
+                    postcode = addr_parts[2]
+                    country = addr_parts[3]
+            elif len(addr_parts) == 5:
+                # Perfect format: "Street, City, State, Postcode, Country"
+                street = addr_parts[0]
+                city = addr_parts[1]
+                state = addr_parts[2]
+                postcode = addr_parts[3]
+                country = addr_parts[4]
+            else:
+                # Fallback for unexpected formats
+                street = addr_parts[0] if len(addr_parts) > 0 else '123 Main St'
+                city = addr_parts[1] if len(addr_parts) > 1 else 'City'
+                state = addr_parts[2] if len(addr_parts) > 2 else ''
+                postcode = addr_parts[3] if len(addr_parts) > 3 else '12345'
+                country = addr_parts[4] if len(addr_parts) > 4 else 'US'
             
-            # Get country code - it's already a 2-letter code from Shopify
-            country_code = addr_parts[4].strip().upper() if addr_parts[4] else 'US'
+            # Clean up the values
+            street = street.strip()
+            city = city.strip()
+            state_code = state.strip().upper()[:10]  # Limit length and uppercase
+            postcode = postcode.strip()
+            country_code = country.strip().upper()[:2]  # Must be 2 chars
             
-            # Validate it's 2 characters
+            print(f"[lulu] Parsed address:")
+            print(f"  Street: {street}")
+            print(f"  City: {city}")
+            print(f"  State: {state_code}")
+            print(f"  Postcode: {postcode}")
+            print(f"  Country: {country_code}")
+            
+            # Validate country code is 2 characters
             if len(country_code) != 2:
                 print(f"[lulu] WARNING: Invalid country code '{country_code}', defaulting to US")
                 country_code = 'US'
-            
-            # State code is already correct from Shopify
-            state_code = addr_parts[2].strip().upper() if addr_parts[2] else 'CA'
-            
-            print(f"[lulu] Final country code: {country_code}")
-            print(f"[lulu] Final state code: {state_code}")
             
             # Correct order structure with URLs
             order_data = {
@@ -507,10 +541,10 @@ def send_to_lulu():
                 }],
                 'shipping_address': {
                     'name': customer_name or 'Customer',
-                    'street1': addr_parts[0] if addr_parts[0] else '123 Main St',
-                    'city': addr_parts[1] if addr_parts[1] else 'City',
+                    'street1': street,
+                    'city': city,
                     'state_code': state_code,
-                    'postcode': addr_parts[3] if addr_parts[3] else '12345',
+                    'postcode': postcode,
                     'country_code': country_code,
                     'email': customer_email or 'no-reply@example.com',
                     'phone_number': data.get('phone', '+1234567890')  # Required with default
